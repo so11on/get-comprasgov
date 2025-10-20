@@ -43,6 +43,6 @@ jobs:
         env:
           FIREBASE_SA_PATH: firebase_sa.json
           GCP_SHEETS_SA_PATH: gcp_sheets_sa.json
-          COMPRAS_GOV_API_KEY: ${{ secrets.COMPRAS_GOV_API_KEY }}
+          FIRESTORE_PROJECT_ID: get-comprasgov
         run: |
           python script.py
