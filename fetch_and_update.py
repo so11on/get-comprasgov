@@ -1,0 +1,574 @@
+%%writefile fetch_and_update.py
+# -*- coding: utf-8 -*-
+"""
+Pipeline PNCP -> Firestore
+- Lê idCompra do Google Sheets (aba 'Buscas', coluna 'idCompra')
+- Busca 2.1 (Itens) e 3.1 (Resultados)
+- Busca Pesquisa de Preços (CSV) apenas se faltar no cache (coleção PESQUISA_PRECOS),
+  filtrando por idCompra, numeroItemCompra e codigoUasg == 986001
+- Salva nas coleções: ITENS, RESULTADOS, PESQUISA_PRECOS
+Obs.: RESULTADOS NÃO recebe mais campo 'marca' (fica só em PESQUISA_PRECOS)
+"""
+
+import os
+import io
+import json
+import time
+import logging
+from typing import Any, Dict, List, Optional, Set
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import csv as pycsv
+
+import gspread
+from google.oauth2.service_account import Credentials
+from google.cloud import firestore
+
+# === Correção robusta de encoding (CSV) ===
+from charset_normalizer import from_bytes
+from ftfy import fix_text
+
+# ================= CONFIG =================
+PLANILHA_ID = "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q"
+ABA_SHEETS = "Buscas"
+
+BASE = "https://dadosabertos.compras.gov.br"
+EP_ITENS = f"{BASE}/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id"
+EP_RES   = f"{BASE}/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id"
+EP_CSV   = f"{BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
+
+COL_ITENS = "ITENS"
+COL_RES   = "RESULTADOS"
+COL_PRECO = "PESQUISA_PRECOS"
+
+# UASG alvo para filtrar linhas do CSV (coluna 'codigoUasg')
+UASG_ALVO = os.getenv("UASG_ALVO", "986001")
+
+# Pausa anti-bloqueio (30s por request por padrão) — ajuste via env THROTTLE_SECONDS
+THROTTLE_SECONDS = int(os.getenv("THROTTLE_SECONDS", "5"))
+
+# ================= CAMPOS CANÔNICOS =================
+# ITENS: exatamente os campos especificados
+ITENS_KEEP = {
+    "idCompra",
+    "idCompraItem",
+    "idContratacaoPNCP",
+    "unidadeOrgaoCodigoUnidade",
+    "orgaoEntidadeCnpj",
+    "numeroItemPncp",
+    "numeroItemCompra",
+    "numeroGrupo",
+    "descricaoResumida",
+    "materialOuServicoNome",
+    "codigoClasse",
+    "codigoGrupo",
+    "codItemCatalogo",
+    "descricaodetalhada",
+    "unidadeMedida",
+    "situacaoCompraItemNome",
+    "tipoBeneficioNome",
+    "quantidade",
+    "valorUnitarioEstimado",
+    "valorTotal",
+    "temResultado",
+    "codFornecedor",
+    "nomeFornecedor",
+    "quantidadeResultado",
+    "valorUnitarioResultado",
+    "valorTotalResultado",
+    "dataResultado",
+    "numeroControlePNCPCompra",
+}
+
+# RESULTADOS: exatamente os campos especificados
+RESULTADOS_KEEP = {
+    "idCompraItem",
+    "idCompra",
+    "idContratacaoPNCP",
+    "unidadeOrgaoCodigoUnidade",
+    "numeroItemPncp",
+    "sequencialResultado",
+    "niFornecedor",
+    "tipoPessoa",
+    "nomeRazaoSocialFornecedor",
+    "ordemClassificacaoSrp",
+    "quantidadeHomologada",
+    "valorUnitarioHomologado",
+    "valorTotalHomologado",
+    "percentualDesconto",
+    "situacaoCompraItemResultadoNome",
+    "porteFornecedorNome",
+    "naturezaJuridicaNome",
+    "dataInclusaoPncp",
+    "dataAtualizacaoPncp",
+    "dataCancelamentoPncp",
+    "dataResultadoPncp",
+    "numeroControlePNCPCompra",
+    "aplicacaoBeneficioMeepp",
+    "aplicacaoCriterioDesempate",
+    "amparoLegalCriterioDesempateNome",
+    "moedaEstrangeiraId",
+    "dataCotacaoMoedaEstrangeira",
+    "valorNominalMoedaEstrangeira",
+    "paisOrigemProdutoServicoId",
+}
+
+# PESQUISA_PRECOS: mapear CSV -> chaves canônicas (armazenar só essas)
+# (lista de candidatos de header para tolerar variações de nomes no CSV)
+PRECO_FIELD_CANDIDATES: Dict[str, List[str]] = {
+    "idCompra": ["idCompra", "id_compra"],
+    "idItemCompra": ["idItemCompra", "id_item_compra", "idItem", "idItemPncp"],
+    "modalidade": ["modalidade", "Modalidade"],
+    "numeroItemCompra": ["numeroItemCompra", "numero_item_compra", "numeroItemPncp", "nItem"],
+    "descricaoItem": ["descricaoItem", "descricao_item", "descricao", "descricaoResumida"],
+    "codigoItemCatalogo": ["codigoItemCatalogo", "codItemCatalogo", "codigo_item_catalogo"],
+    "siglaUnidadeMedida": ["siglaUnidadeMedida", "sigla_unidade_medida", "siglaUnidade", "siglaUnidMedida"],
+    "nomeUnidadeFornecimento": ["nomeUnidadeFornecimento", "nome_unidade_fornecimento"],
+    "siglaUnidadeFornecimento": ["siglaUnidadeFornecimento", "sigla_unidade_fornecimento"],
+    "quantidade": ["quantidade", "qtde", "qtd"],
+    "precoUnitario": ["precoUnitario", "preco_unitario", "valorUnitario"],
+    "percentualMaiorDesconto": ["percentualMaiorDesconto", "percMaiorDesconto"],
+    "niFornecedor": ["niFornecedor", "cnpjCpfFornecedor", "cnpjFornecedor"],
+    "nomeFornecedor": ["nomeFornecedor", "razaoSocialFornecedor", "fornecedor"],
+    "marca": ["marca", "Marca"],
+    "codigoUasg": ["codigoUasg", "codigo_uasg", "uasg", "codigoUASG"],
+    "nomeUasg": ["nomeUasg", "NomeUasg"],
+    "municipio": ["municipio", "Município", "cidade"],
+    "dataCompra": ["dataCompra", "data_compra"],
+    "dataHoraAtualizacaoCompra": ["dataHoraAtualizacaoCompra", "dtHrAtualizacaoCompra"],
+    "dataHoraAtualizacaoItem": ["dataHoraAtualizacaoItem", "dtHrAtualizacaoItem"],
+    "dataResultado": ["dataResultado", "data_resultado"],
+    "dataHoraAtualizacaoUasg": ["dataHoraAtualizacaoUasg", "dtHrAtualizacaoUasg"],
+    "codigoClasse": ["codigoClasse", "codClasse"],
+}
+
+# ================= LOG =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("pncp-sync")
+
+# ============== Credenciais (Sheets x Firestore) ==============
+def build_sheets_credentials() -> Credentials:
+    sa_json = os.getenv("SERVICE_ACCOUNT_JSON")
+    sa_file = os.getenv("SERVICE_ACCOUNT_FILE")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+    if sa_json:
+        info = json.loads(sa_json)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    if sa_file:
+        return Credentials.from_service_account_file(sa_file, scopes=scopes)
+    raise RuntimeError("Defina SERVICE_ACCOUNT_JSON ou SERVICE_ACCOUNT_FILE para Sheets.")
+
+def build_firestore_credentials() -> Credentials:
+    sa_json = os.getenv("SERVICE_ACCOUNT_JSON")
+    sa_file = os.getenv("SERVICE_ACCOUNT_FILE")
+    if sa_json:
+        info = json.loads(sa_json)
+        return Credentials.from_service_account_info(info)  # sem escopos
+    if sa_file:
+        return Credentials.from_service_account_file(sa_file)  # sem escopos
+    raise RuntimeError("Defina SERVICE_ACCOUNT_JSON ou SERVICE_ACCOUNT_FILE para Firestore.")
+
+def make_firestore_client(creds: Credentials) -> firestore.Client:
+    project = os.getenv("FIRESTORE_PROJECT_ID", None)
+    if not project:
+        raise RuntimeError("Defina FIRESTORE_PROJECT_ID (ex.: get-comprasgov).")
+    return firestore.Client(project=project, credentials=creds)
+
+def make_sheets_client(creds: Credentials) -> gspread.Client:
+    return gspread.authorize(creds)
+
+# ============== HTTP com retry + throttle ==============
+_last_call = 0.0
+def throttle():
+    global _last_call
+    now = time.time()
+    delta = now - _last_call
+    if delta < THROTTLE_SECONDS:
+        time.sleep(max(0, THROTTLE_SECONDS - delta))
+    _last_call = time.time()
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+def get_json(session: requests.Session, url: str, params: Dict[str, Any]) -> Any:
+    throttle()
+    r = session.get(url, params=params, headers={"Accept":"application/json"}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def get_bytes(session: requests.Session, url: str, params: Dict[str, Any]) -> bytes:
+    throttle()
+    r = session.get(url, params=params, headers={"Accept":"text/csv, */*"}, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+# ============== Helpers ==============
+def normalize_str(val: Any) -> Optional[str]:
+    if val is None: return None
+    s = str(val).strip()
+    return s or None
+
+def only_fields(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if k in keep}
+
+def ler_ids(gc: gspread.Client) -> List[str]:
+    ws = gc.open_by_key(PLANILHA_ID).worksheet(ABA_SHEETS)
+    df = pd.DataFrame(ws.get_all_records())
+    df.columns = [c.strip() for c in df.columns]
+    if "idCompra" not in df.columns:
+        raise RuntimeError("A aba 'Buscas' deve conter a coluna 'idCompra'.")
+    ids: List[str] = []
+    for _, row in df.iterrows():
+        s = normalize_str(row.get("idCompra"))
+        if s:
+            ids.append(s)
+    return sorted(set(ids))
+
+def doc_id_preco(id_compra: str, numero_item: str) -> str:
+    return f"{id_compra}-{numero_item}"
+
+# ============== Paginação PNCP (resultado + páginas) ==============
+def fetch_paginated_resultado(session: requests.Session, endpoint: str, base_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    resultados: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        params = dict(base_params)
+        params["pagina"] = page
+        payload = get_json(session, endpoint, params)
+        if isinstance(payload, dict) and "resultado" in payload:
+            lista = payload.get("resultado") or []
+            if isinstance(lista, list):
+                resultados.extend([x for x in lista if isinstance(x, dict)])
+            total_paginas = payload.get("totalPaginas")
+            paginas_rest = payload.get("paginasRestantes")
+            if total_paginas is not None and isinstance(total_paginas, int):
+                if page >= total_paginas:
+                    break
+            elif paginas_rest is not None and isinstance(paginas_rest, int):
+                if paginas_rest <= 0:
+                    break
+            else:
+                break
+            page += 1
+        else:
+            break
+    return resultados
+
+# ============== Coleta (2.1 e 3.1 por idCompra) ==============
+def get_itens_21_por_id(session: requests.Session, id_compra: str) -> List[Dict[str, Any]]:
+    raw_list = fetch_paginated_resultado(session, EP_ITENS, {"tipo": "idCompra", "codigo": id_compra})
+    itens: List[Dict[str, Any]] = []
+    for raw in raw_list:
+        # Seleciona só os campos desejados (com alguns renomes de segurança)
+        raw = dict(raw)
+        # Garante strings onde necessário
+        raw["numeroItemPncp"] = normalize_str(raw.get("numeroItemPncp"))
+        raw["numeroItemCompra"] = normalize_str(raw.get("numeroItemCompra"))
+        raw["codItemCatalogo"] = normalize_str(raw.get("codItemCatalogo"))
+        # Filtra para o conjunto final:
+        doc = only_fields(raw, ITENS_KEEP)
+        # Garante idCompra
+        doc.setdefault("idCompra", id_compra)
+        itens.append(doc)
+    return itens
+
+def get_resultados_31_por_id(session: requests.Session, id_compra: str) -> List[Dict[str, Any]]:
+    raw_list = fetch_paginated_resultado(session, EP_RES, {"tipo": "idCompra", "codigo": id_compra})
+    resultados: List[Dict[str, Any]] = []
+    for raw in raw_list:
+        raw = dict(raw)
+        raw["numeroItemPncp"] = normalize_str(raw.get("numeroItemPncp"))
+        raw["niFornecedor"]   = normalize_str(raw.get("niFornecedor"))
+        doc = only_fields(raw, RESULTADOS_KEEP)
+        doc.setdefault("idCompra", id_compra)
+        resultados.append(doc)
+    return resultados
+
+# ============== CSV: decodificar corretamente e corrigir mojibake ==============
+def _decode_csv_bytes(raw: bytes) -> str:
+    """
+    Decodifica os bytes do CSV sem perder acentos:
+    - detecta encoding com charset-normalizer (sem 'ignore')
+    - ftfy para consertar mojibake
+    - se ainda houver artefatos, tenta latin1->utf8
+    """
+    try:
+        probe = from_bytes(raw).best()
+        if probe and probe.encoding:
+            decoded_main = raw.decode(probe.encoding, errors="strict")
+        else:
+            decoded_main = raw.decode("utf-8", errors="strict")
+    except Exception:
+        try:
+            decoded_main = raw.decode("latin-1", errors="strict")
+        except Exception:
+            decoded_main = raw.decode("cp1252", errors="strict")
+
+    fixed_main = fix_text(decoded_main)
+
+    def score_bad(s: str) -> int:
+        return sum(s.count(ch) for ch in ("Ã","Â"," "))
+
+    if score_bad(fixed_main) > 0:
+        try:
+            alt = decoded_main.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+            alt_fixed = fix_text(alt)
+            if score_bad(alt_fixed) < score_bad(fixed_main):
+                fixed_main = alt_fixed
+        except Exception:
+            pass
+
+    return fixed_main
+
+def _read_csv_bytes_to_df(raw: bytes) -> pd.DataFrame:
+    decoded = _decode_csv_bytes(raw)
+    # Detecta delimitador ; ou , com Sniffer
+    sample = decoded[:4096]
+    try:
+        dialect = pycsv.Sniffer().sniff(sample, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        sep = ";"
+    df = pd.read_csv(io.StringIO(decoded), sep=sep, dtype=str, na_filter=False, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    # mapa case-insensitive
+    df.attrs["_lower_map"] = {c.lower(): c for c in df.columns}
+    return df
+
+def _get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    lower_map = df.attrs.get("_lower_map", {c.lower(): c for c in df.columns})
+    for c in candidates:
+        real = lower_map.get(c.lower())
+        if real:
+            return real
+    return None
+
+def _row_to_precos_payload(row: Dict[str, Any], colmap: Dict[str, str]) -> Dict[str, Any]:
+    """Extrai do row apenas os campos canônicos (PRECO_FIELD_CANDIDATES), usando colmap (header real)."""
+    out: Dict[str, Any] = {}
+    for target_key, real_col in colmap.items():
+        if real_col:
+            val = row.get(real_col)
+            out[target_key] = None if (val is None or str(val).strip()=="") else str(val).strip()
+        else:
+            out[target_key] = None
+    return out
+
+# ============== Cache Firestore para PESQUISA_PRECOS ==============
+def preco_docs_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Set[str]:
+    """Retorna o conjunto de chaves {idCompra-numeroItem} que já existem em PESQUISA_PRECOS."""
+    if not item_nums:
+        return set()
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    existing: Set[str] = set()
+    for snap in db.get_all(refs):
+        if snap.exists:
+            existing.add(snap.id)  # já é idCompra-numItem
+    return existing
+
+def carregar_cache_precos_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Lê do Firestore os docs de PESQUISA_PRECOS para (id_compra, item_nums) e
+    retorna mapa numeroItem -> dict completo (apenas os campos canônicos).
+    """
+    if not item_nums:
+        return {}
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    mapa: Dict[str, Dict[str, Any]] = {}
+    for snap in db.get_all(refs):
+        if snap.exists:
+            num_item = snap.id.split("-", 1)[1] if "-" in snap.id else None
+            if num_item:
+                mapa[num_item] = snap.to_dict()
+    return mapa
+
+# ============== Baixar CSV só para itens faltantes e gravar (filtrado por UASG) ==============
+def fetch_and_upsert_pesquisa_precos(
+    db: firestore.Client,
+    session: requests.Session,
+    id_compra: str,
+    itens: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Baixa CSV por codItemCatalogo APENAS para itens que ainda não têm doc em PESQUISA_PRECOS,
+    filtra por:
+      - idCompra == id_compra
+      - numeroItemCompra ∈ faltantes
+      - codigoUasg == UASG_ALVO
+    e grava somente os campos canônicos em PESQUISA_PRECOS/{idCompra}-{numeroItemCompra}.
+    Retorna um mapa: numeroItem -> payload (para uso futuro, se necessário).
+    """
+    # 1) conjunto de itens (numeroItemPncp) e códigos
+    item_nums_all: Set[str] = {
+        (normalize_str(it.get("numeroItemPncp")) or normalize_str(it.get("numeroItemCompra"))) for it in itens
+    }
+    item_nums_all = {n for n in item_nums_all if n}
+    codigos: Set[str] = {normalize_str(it.get("codItemCatalogo")) for it in itens if it.get("codItemCatalogo")}
+    codigos = {c for c in codigos if c}
+
+    # 2) ver o que já existe
+    exists = preco_docs_existentes(db, id_compra, item_nums_all)
+    ja_tem: Set[str] = {doc_id.split("-", 1)[1] for doc_id in exists if "-" in doc_id}
+    faltantes: Set[str] = item_nums_all - ja_tem
+    log.info(f"[PREÇOS] {id_compra}: itens já em cache={len(ja_tem)} | faltantes={len(faltantes)}")
+
+    # carga do cache existente
+    preco_map: Dict[str, Dict[str, Any]] = carregar_cache_precos_existentes(db, id_compra, item_nums_all)
+
+    if not faltantes or not codigos:
+        return preco_map
+
+    # 3) baixar CSV por cada codItemCatalogo e gravar somente os faltantes (e UASG)
+    for cod in sorted(codigos):
+        if not faltantes:
+            break
+        tried_params = [
+            {"codigoItemCatalogo": cod},
+            {"tipo": "codigoItemCatalogo", "codigo": cod},
+        ]
+        raw = None
+        for params in tried_params:
+            try:
+                raw = get_bytes(session, EP_CSV, params)
+                break
+            except requests.HTTPError:
+                continue
+        if not raw:
+            continue
+
+        df = _read_csv_bytes_to_df(raw)
+
+        # Descobrir colunas reais para os campos que queremos
+        real_cols: Dict[str, str] = {}
+        for target, candidates in PRECO_FIELD_CANDIDATES.items():
+            real_cols[target] = _get_col(df, candidates)
+
+        # Precisamos ao menos destas para filtrar:
+        col_idcompra = real_cols.get("idCompra")
+        col_numitem  = real_cols.get("numeroItemCompra")
+        col_uasg     = real_cols.get("codigoUasg")
+
+        if not col_idcompra or not col_numitem or not col_uasg:
+            continue
+
+        dff = df[
+            (df[col_idcompra].astype(str).str.strip() == str(id_compra).strip())
+            &
+            (df[col_numitem].astype(str).str.strip().isin({x.strip() for x in faltantes}))
+            &
+            (df[col_uasg].astype(str).str.strip() == str(UASG_ALVO).strip())
+        ]
+        if dff.empty:
+            continue
+
+        # Persistir SOMENTE os campos canônicos listados
+        batch = db.batch()
+        novos_ids: Set[str] = set()
+        for _, row in dff.iterrows():
+            row_dict = row.to_dict()
+            payload = _row_to_precos_payload(row_dict, real_cols)
+            num_item = payload.get("numeroItemCompra")
+            if not num_item:
+                continue
+            payload["updatedAt"] = firestore.SERVER_TIMESTAMP
+            ref = db.collection(COL_PRECO).document(doc_id_preco(id_compra, num_item))
+            batch.set(ref, payload, merge=True)
+            preco_map[num_item] = payload
+            novos_ids.add(num_item)
+        batch.commit()
+
+        # Atualiza faltantes (os que ganharam registro)
+        faltantes -= novos_ids
+        log.info(f"[PREÇOS] {id_compra}: codItemCatalogo {cod} -> inseridos/atualizados {len(novos_ids)} itens")
+
+    return preco_map
+
+# ============== Persistência (upsert) ==============
+def upsert_itens(db: firestore.Client, itens: List[Dict[str, Any]]):
+    if not itens: 
+        return
+    batch = db.batch()
+    for it in itens:
+        id_compra = it.get("idCompra")
+        num_item  = normalize_str(it.get("numeroItemPncp"))
+        if not id_compra or not num_item:
+            continue
+        it_clean = only_fields(it, ITENS_KEEP)
+        it_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
+        ref = db.collection(COL_ITENS).document(f"{id_compra}-{num_item}")
+        batch.set(ref, it_clean, merge=True)
+    batch.commit()
+
+def upsert_resultados(db: firestore.Client, resultados: List[Dict[str, Any]]):
+    if not resultados:
+        return
+    batch = db.batch()
+    for r in resultados:
+        id_compra = r.get("idCompra")
+        num_item  = normalize_str(r.get("numeroItemPncp"))
+        ni        = normalize_str(r.get("niFornecedor"))
+        if not id_compra or not num_item or not ni:
+            continue
+        r_clean = only_fields(r, RESULTADOS_KEEP)
+        r_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
+        ref = db.collection(COL_RES).document(f"{id_compra}-{num_item}-{ni}")
+        batch.set(ref, r_clean, merge=True)
+    batch.commit()
+
+# ============== Pipeline ==============
+def processar():
+    creds_sheets = build_sheets_credentials()
+    creds_fs = build_firestore_credentials()
+
+    gc = make_sheets_client(creds_sheets)
+    db = make_firestore_client(creds_fs)
+    session = make_session()
+
+    log.info(f"Firestore conectado no projeto: {db.project}")
+
+    ids = ler_ids(gc)
+    log.info(f"IDs a processar: {ids}")
+
+    for idc in ids:
+        try:
+            log.info(f"==> {idc}")
+            # 1) 2.1 Itens
+            itens = get_itens_21_por_id(session, idc)
+            log.info(f"[2.1] {idc}: itens = {len(itens)}")
+
+            # 2) PESQUISA_PRECOS (cache + fetch faltantes com filtro UASG)
+            _ = fetch_and_upsert_pesquisa_precos(db, session, idc, itens)
+
+            # 3) 3.1 Resultados (sem enriquecer com marca)
+            resultados = get_resultados_31_por_id(session, idc)
+            log.info(f"[3.1] {idc}: resultados = {len(resultados)}")
+
+            # 4) Persistir ITENS e RESULTADOS
+            upsert_itens(db, itens)
+            upsert_resultados(db, resultados)
+
+            log.info(f"✔ {idc}: ITENS={len(itens)} | RESULTADOS={len(resultados)} | PREÇOS(atualizado quando faltante)")
+        except requests.HTTPError as e:
+            body = e.response.text[:500] if e.response is not None else ""
+            log.error(f"HTTPError {idc}: status={getattr(e.response,'status_code',None)} body={body}")
+        except Exception as e:
+            log.exception(f"Falha em {idc}: {e}")
+
+if __name__ == "__main__":
+    processar()

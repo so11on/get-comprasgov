@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'build',
+        '-t',
+        'southamerica-east1-docker.pkg.dev/get-comprasgov/pncp-repo/pncp:latest',
+        '.'
+      ]
+images:
+  - 'southamerica-east1-docker.pkg.dev/get-comprasgov/pncp-repo/pncp:latest'
