@@ -1,0 +1,49 @@
+name: compras-gov-cron
+
+on:
+  schedule:
+    - cron: "0 11,17,23 * * *"   # 08:00, 14:00, 20:00 BRT (UTC-3) → 11:00, 17:00, 23:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compras-gov-cron
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Write service account files from secrets
+        env:
+          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
+          GCP_SHEETS_SA_JSON: ${{ secrets.GCP_SHEETS_SA_JSON }}
+        run: |
+          echo "$FIREBASE_SA_JSON" > firebase_sa.json
+          echo "$GCP_SHEETS_SA_JSON" > gcp_sheets_sa.json
+
+      - name: Run script
+        env:
+          FIREBASE_SA_PATH: firebase_sa.json
+          GCP_SHEETS_SA_PATH: gcp_sheets_sa.json
+          COMPRAS_GOV_API_KEY: ${{ secrets.COMPRAS_GOV_API_KEY }}
+        run: |
+          python script.py
