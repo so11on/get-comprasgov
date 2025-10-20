@@ -3,10 +3,13 @@
 Pipeline PNCP -> Firestore
 - Lê idCompra do Google Sheets (aba 'Buscas', coluna 'idCompra')
 - Busca 2.1 (Itens) e 3.1 (Resultados)
-- Busca Pesquisa de Preços (CSV) apenas se faltar no cache (coleção PESQUISA_PRECOS),
-  filtrando por idCompra, numeroItemCompra e codigoUasg == UASG_ALVO
 - Salva nas coleções: ITENS, RESULTADOS, PESQUISA_PRECOS
-Obs.: RESULTADOS NÃO recebe campo 'marca' (apenas em PESQUISA_PRECOS)
+- RESULTADOS NÃO recebe campo 'marca' (apenas em PESQUISA_PRECOS)
+
+Atualizações:
+- Upsert condicional: só grava quando houver diferença real (evita writes desnecessários)
+- Pesquisa de Preços: só é feita quando algum RESULTADO foi alterado/criado
+- Normalização canônica em comparações (ignora updatedAt, normaliza strings e números)
 """
 
 import os
@@ -16,6 +19,7 @@ import json
 import time
 import logging
 from typing import Any, Dict, List, Optional, Set, Iterable, Tuple
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import requests
@@ -259,7 +263,7 @@ def get_bytes(session: requests.Session, url: str, params: Dict[str, Any]) -> by
     r.raise_for_status()
     return r.content
 
-# ============== Helpers ==============
+# ============== Helpers de normalização/comparação ==============
 def normalize_str(val: Any) -> Optional[str]:
     if val is None:
         return None
@@ -272,6 +276,169 @@ def only_fields(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
 def pick_num_item_pncp_or_compra(obj: Dict[str, Any]) -> Optional[str]:
     return normalize_str(obj.get("numeroItemPncp")) or normalize_str(obj.get("numeroItemCompra"))
 
+def _to_decimal_or_str(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, (int, float, Decimal)):
+        try:
+            return Decimal(str(x))
+        except InvalidOperation:
+            return str(x)
+    s = str(x).strip()
+    if re.match(r"^-?\d+[.,]\d+$", s):
+        s = s.replace(",", ".")
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return s or None
+
+def _normalize_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s != "" else None
+    if isinstance(v, (int, float, Decimal)):
+        return _to_decimal_or_str(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, list):
+        return [_normalize_value(i) for i in v]
+    if isinstance(v, dict):
+        return {k: _normalize_value(vv) for k, vv in v.items()}
+    return v
+
+def _canonical_doc(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    base = only_fields(d, keep)
+    base.pop("updatedAt", None)
+    norm = {k: _normalize_value(v) for k, v in base.items()}
+    return {k: v for k, v in norm.items() if v is not None}
+
+def _docs_differ(local_payload: Dict[str, Any], remote_doc: Optional[Dict[str, Any]], keep: set) -> bool:
+    left = _canonical_doc(local_payload, keep)
+    right = _canonical_doc(remote_doc or {}, keep)
+    return left != right
+
+# ============== OCR/CSV decodificação e parsing ==============
+def _decode_csv_bytes(raw: bytes) -> str:
+    """
+    Decodifica os bytes do CSV sem perder acentos:
+    - detecta encoding com charset-normalizer (sem 'ignore')
+    - ftfy para consertar mojibake
+    - fallback para latin-1/cp1252
+    """
+    try:
+        probe = from_bytes(raw).best()
+        if probe and probe.encoding:
+            decoded_main = raw.decode(probe.encoding, errors="strict")
+        else:
+            decoded_main = raw.decode("utf-8", errors="strict")
+    except Exception:
+        try:
+            decoded_main = raw.decode("latin-1", errors="strict")
+        except Exception:
+            decoded_main = raw.decode("cp1252", errors="strict")
+
+    fixed_main = fix_text(decoded_main)
+
+    def score_bad(s: str) -> int:
+        return sum(s.count(ch) for ch in ("Ã", "Â"))
+
+    if score_bad(fixed_main) > 0:
+        try:
+            alt = decoded_main.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+            alt_fixed = fix_text(alt)
+            if score_bad(alt_fixed) < score_bad(fixed_main):
+                fixed_main = alt_fixed
+        except Exception:
+            pass
+
+    return fixed_main
+
+def _read_csv_bytes_to_df(raw: bytes) -> pd.DataFrame:
+    decoded = _decode_csv_bytes(raw)
+    sample = decoded[:4096]
+    try:
+        dialect = pycsv.Sniffer().sniff(sample, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        sep = ";"
+    df = pd.read_csv(io.StringIO(decoded), sep=sep, dtype=str, na_filter=False, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    df.attrs["_lower_map"] = {c.lower(): c for c in df.columns}
+    return df
+
+def _get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    lower_map = df.attrs.get("_lower_map", {c.lower(): c for c in df.columns})
+    for c in candidates:
+        real = lower_map.get(c.lower())
+        if real:
+            return real
+    return None
+
+def _row_to_precos_payload(row: Dict[str, Any], colmap: Dict[str, str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for target_key, real_col in colmap.items():
+        if real_col:
+            val = row.get(real_col)
+            out[target_key] = None if (val is None or str(val).strip() == "") else str(val).strip()
+        else:
+            out[target_key] = None
+    return out
+
+# ============== Firestore utils (chunks e leitura em lote) ==============
+def _commit_in_chunks(writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]], db: firestore.Client, chunk_size: int = BATCH_CHUNK_SIZE):
+    if DRY_RUN or not writes:
+        return
+    for i in range(0, len(writes), chunk_size):
+        batch = db.batch()
+        for ref, payload in writes[i:i+chunk_size]:
+            batch.set(ref, payload, merge=True)
+        batch.commit()
+
+def _get_all_chunked(db: firestore.Client, refs: List[firestore.DocumentReference], chunk: int = GET_ALL_CHUNK):
+    snaps = []
+    for i in range(0, len(refs), chunk):
+        snaps.extend(db.get_all(refs[i:i+chunk]))
+    return snaps
+
+def _load_existing_map(db: firestore.Client, col_name: str, ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not ids:
+        return {}
+    refs = [db.collection(col_name).document(doc_id) for doc_id in ids]
+    out: Dict[str, Dict[str, Any]] = {}
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            out[snap.id] = snap.to_dict()
+    return out
+
+# ============== Cache Firestore para PESQUISA_PRECOS ==============
+def doc_id_preco(id_compra: str, numero_item: str) -> str:
+    return f"{id_compra}-{numero_item}"
+
+def preco_docs_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Set[str]:
+    if not item_nums:
+        return set()
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    existing: Set[str] = set()
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            existing.add(snap.id)
+    return existing
+
+def carregar_cache_precos_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Dict[str, Dict[str, Any]]:
+    if not item_nums:
+        return {}
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    mapa: Dict[str, Dict[str, Any]] = {}
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            num_item = snap.id.split("-", 1)[1] if "-" in snap.id else None
+            if num_item:
+                mapa[num_item] = snap.to_dict()
+    return mapa
+
+# ============== Paginação PNCP (resultado + páginas) ==============
 ID_RE = re.compile(r"^\d{4,}$")  # ajuste conforme formato esperado
 
 def ler_ids(gc: gspread.Client) -> List[str]:
@@ -292,10 +459,6 @@ def ler_ids(gc: gspread.Client) -> List[str]:
     ids = [i for i in ids if ID_RE.match(i)]
     return sorted(set(ids))
 
-def doc_id_preco(id_compra: str, numero_item: str) -> str:
-    return f"{id_compra}-{numero_item}"
-
-# ============== Paginação PNCP (resultado + páginas) ==============
 def fetch_paginated_resultado(session: requests.Session, endpoint: str, base_params: Dict[str, Any], max_pages: int = MAX_PAGES) -> List[Dict[str, Any]]:
     resultados: List[Dict[str, Any]] = []
     page = 1
@@ -343,115 +506,6 @@ def get_resultados_31_por_id(session: requests.Session, id_compra: str) -> List[
         resultados.append(doc)
     return resultados
 
-# ============== CSV: decodificar corretamente e corrigir mojibake ==============
-def _decode_csv_bytes(raw: bytes) -> str:
-    """
-    Decodifica os bytes do CSV sem perder acentos:
-    - detecta encoding com charset-normalizer (sem 'ignore')
-    - ftfy para consertar mojibake
-    - fallback para latin-1/cp1252
-    """
-    try:
-        probe = from_bytes(raw).best()
-        if probe and probe.encoding:
-            decoded_main = raw.decode(probe.encoding, errors="strict")
-        else:
-            decoded_main = raw.decode("utf-8", errors="strict")
-    except Exception:
-        try:
-            decoded_main = raw.decode("latin-1", errors="strict")
-        except Exception:
-            decoded_main = raw.decode("cp1252", errors="strict")
-
-    fixed_main = fix_text(decoded_main)
-
-    def score_bad(s: str) -> int:
-        # Remove espaço da contagem para evitar falso-positivo
-        return sum(s.count(ch) for ch in ("Ã", "Â"))
-
-    if score_bad(fixed_main) > 0:
-        try:
-            alt = decoded_main.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
-            alt_fixed = fix_text(alt)
-            if score_bad(alt_fixed) < score_bad(fixed_main):
-                fixed_main = alt_fixed
-        except Exception:
-            pass
-
-    return fixed_main
-
-def _read_csv_bytes_to_df(raw: bytes) -> pd.DataFrame:
-    decoded = _decode_csv_bytes(raw)
-    # Detecta delimitador ; ou , com Sniffer
-    sample = decoded[:4096]
-    try:
-        dialect = pycsv.Sniffer().sniff(sample, delimiters=";,")
-        sep = dialect.delimiter
-    except Exception:
-        sep = ";"
-    df = pd.read_csv(io.StringIO(decoded), sep=sep, dtype=str, na_filter=False, engine="python")
-    df.columns = [str(c).strip() for c in df.columns]
-    # mapa case-insensitive
-    df.attrs["_lower_map"] = {c.lower(): c for c in df.columns}
-    return df
-
-def _get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    lower_map = df.attrs.get("_lower_map", {c.lower(): c for c in df.columns})
-    for c in candidates:
-        real = lower_map.get(c.lower())
-        if real:
-            return real
-    return None
-
-def _row_to_precos_payload(row: Dict[str, Any], colmap: Dict[str, str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for target_key, real_col in colmap.items():
-        if real_col:
-            val = row.get(real_col)
-            out[target_key] = None if (val is None or str(val).strip() == "") else str(val).strip()
-        else:
-            out[target_key] = None
-    return out
-
-# ============== Utilitários Firestore (chunks) ==============
-def _commit_in_chunks(writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]], db: firestore.Client, chunk_size: int = BATCH_CHUNK_SIZE):
-    if DRY_RUN or not writes:
-        return
-    for i in range(0, len(writes), chunk_size):
-        batch = db.batch()
-        for ref, payload in writes[i:i+chunk_size]:
-            batch.set(ref, payload, merge=True)
-        batch.commit()
-
-def _get_all_chunked(db: firestore.Client, refs: List[firestore.DocumentReference], chunk: int = GET_ALL_CHUNK):
-    snaps = []
-    for i in range(0, len(refs), chunk):
-        snaps.extend(db.get_all(refs[i:i+chunk]))
-    return snaps
-
-# ============== Cache Firestore para PESQUISA_PRECOS ==============
-def preco_docs_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Set[str]:
-    if not item_nums:
-        return set()
-    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
-    existing: Set[str] = set()
-    for snap in _get_all_chunked(db, refs):
-        if snap.exists:
-            existing.add(snap.id)
-    return existing
-
-def carregar_cache_precos_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Dict[str, Dict[str, Any]]:
-    if not item_nums:
-        return {}
-    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
-    mapa: Dict[str, Dict[str, Any]] = {}
-    for snap in _get_all_chunked(db, refs):
-        if snap.exists:
-            num_item = snap.id.split("-", 1)[1] if "-" in snap.id else None
-            if num_item:
-                mapa[num_item] = snap.to_dict()
-    return mapa
-
 # ============== Baixar CSV só para itens faltantes e gravar (filtrado por UASG) ==============
 def fetch_and_upsert_pesquisa_precos(
     db: firestore.Client,
@@ -459,6 +513,10 @@ def fetch_and_upsert_pesquisa_precos(
     id_compra: str,
     itens: List[Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
+    """
+    Busca CSVs por codItemCatalogo, filtra por idCompra, numeroItemCompra e UASG_ALVO.
+    Upsert condicional: só grava se houver diferença.
+    """
     item_nums_all: Set[str] = {pick_num_item_pncp_or_compra(it) for it in itens}
     item_nums_all = {n for n in item_nums_all if n}
     codigos: Set[str] = {normalize_str(it.get("codItemCatalogo")) for it in itens if it.get("codItemCatalogo")}
@@ -513,6 +571,18 @@ def fetch_and_upsert_pesquisa_precos(
         if dff.empty:
             continue
 
+        # Pré-carrega existentes para comparação condicional
+        existing_ids: List[str] = []
+        for _, row in dff.iterrows():
+            row_dict = row.to_dict()
+            payload = _row_to_precos_payload(row_dict, {k: (v or "") for k, v in real_cols.items()})
+            num_item = payload.get("numeroItemCompra")
+            if not num_item:
+                continue
+            doc_id = doc_id_preco(id_compra, num_item)
+            existing_ids.append(doc_id)
+        existing_map = _load_existing_map(db, COL_PRECO, existing_ids)
+
         writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
         novos_ids: Set[str] = set()
         for _, row in dff.iterrows():
@@ -521,11 +591,14 @@ def fetch_and_upsert_pesquisa_precos(
             num_item = payload.get("numeroItemCompra")
             if not num_item:
                 continue
+            doc_id = doc_id_preco(id_compra, num_item)
             payload["updatedAt"] = firestore.SERVER_TIMESTAMP
-            ref = db.collection(COL_PRECO).document(doc_id_preco(id_compra, num_item))
-            writes.append((ref, payload))
-            preco_map[num_item] = payload
-            novos_ids.add(num_item)
+
+            if _docs_differ(payload, existing_map.get(doc_id), set(PRECO_FIELD_CANDIDATES.keys())):
+                ref = db.collection(COL_PRECO).document(doc_id)
+                writes.append((ref, payload))
+                preco_map[num_item] = payload
+                novos_ids.add(num_item)
 
         _commit_in_chunks(writes, db)
         faltantes -= novos_ids
@@ -533,37 +606,62 @@ def fetch_and_upsert_pesquisa_precos(
 
     return preco_map
 
-# ============== Persistência (upsert) ==============
-def upsert_itens(db: firestore.Client, itens: List[Dict[str, Any]]):
+# ============== Persistência (upsert condicional) ==============
+def upsert_itens(db: firestore.Client, itens: List[Dict[str, Any]]) -> int:
     if not itens:
-        return
-    writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+        return 0
+    ids: List[str] = []
+    payload_by_id: Dict[str, Dict[str, Any]] = {}
     for it in itens:
         id_compra = it.get("idCompra")
         num_item  = normalize_str(it.get("numeroItemPncp"))
         if not id_compra or not num_item:
             continue
+        doc_id = f"{id_compra}-{num_item}"
         it_clean = only_fields(it, ITENS_KEEP)
         it_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
-        ref = db.collection(COL_ITENS).document(f"{id_compra}-{num_item}")
-        writes.append((ref, it_clean))
-    _commit_in_chunks(writes, db)
+        ids.append(doc_id)
+        payload_by_id[doc_id] = it_clean
 
-def upsert_resultados(db: firestore.Client, resultados: List[Dict[str, Any]]):
-    if not resultados:
-        return
+    existing = _load_existing_map(db, COL_ITENS, ids)
+
     writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+    for doc_id, payload in payload_by_id.items():
+        if _docs_differ(payload, existing.get(doc_id), ITENS_KEEP):
+            ref = db.collection(COL_ITENS).document(doc_id)
+            writes.append((ref, payload))
+
+    _commit_in_chunks(writes, db)
+    return len(writes)
+
+def upsert_resultados(db: firestore.Client, resultados: List[Dict[str, Any]]) -> int:
+    if not resultados:
+        return 0
+
+    ids: List[str] = []
+    payload_by_id: Dict[str, Dict[str, Any]] = {}
     for r in resultados:
         id_compra = r.get("idCompra")
         num_item  = normalize_str(r.get("numeroItemPncp"))
         ni        = normalize_str(r.get("niFornecedor"))
         if not id_compra or not num_item or not ni:
             continue
+        doc_id = f"{id_compra}-{num_item}-{ni}"
         r_clean = only_fields(r, RESULTADOS_KEEP)
         r_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
-        ref = db.collection(COL_RES).document(f"{id_compra}-{num_item}-{ni}")
-        writes.append((ref, r_clean))
+        ids.append(doc_id)
+        payload_by_id[doc_id] = r_clean
+
+    existing = _load_existing_map(db, COL_RES, ids)
+
+    writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+    for doc_id, payload in payload_by_id.items():
+        if _docs_differ(payload, existing.get(doc_id), RESULTADOS_KEEP):
+            ref = db.collection(COL_RES).document(doc_id)
+            writes.append((ref, payload))
+
     _commit_in_chunks(writes, db)
+    return len(writes)
 
 # ============== Pipeline ==============
 def processar():
@@ -583,20 +681,24 @@ def processar():
     for idc in ids:
         try:
             log.info(f"==> {idc}")
-            # 1) 2.1 Itens
+            # 1) Coletar Itens e Resultados atuais do PNCP
             itens = get_itens_21_por_id(session, idc)
             log.info(f"[2.1] {idc}: itens = {len(itens)}")
 
-            # 2) PESQUISA_PRECOS (cache + fetch faltantes com filtro UASG)
-            _ = fetch_and_upsert_pesquisa_precos(db, session, idc, itens)
-
-            # 3) 3.1 Resultados
             resultados = get_resultados_31_por_id(session, idc)
             log.info(f"[3.1] {idc}: resultados = {len(resultados)}")
 
-            # 4) Persistir ITENS e RESULTADOS
-            upsert_itens(db, itens)
-            upsert_resultados(db, resultados)
+            # 2) Persistir ITENS e RESULTADOS apenas se houver diferença
+            changed_itens = upsert_itens(db, itens)
+            changed_resultados = upsert_resultados(db, resultados)
+
+            log.info(f"[UPSERT] {idc}: ITENS alterados={changed_itens} | RESULTADOS alterados={changed_resultados}")
+
+            # 3) Só buscar Pesquisa de Preços se RESULTADOS mudou
+            if changed_resultados > 0:
+                _ = fetch_and_upsert_pesquisa_precos(db, session, idc, itens)
+            else:
+                log.info(f"[PREÇOS] {idc}: pulado (sem mudanças em RESULTADOS).")
 
         except requests.HTTPError as e:
             body = e.response.text[:500] if e.response is not None else ""
