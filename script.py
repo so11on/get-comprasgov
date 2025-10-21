@@ -348,10 +348,10 @@ def compor_status(qtd_itens: int, qtd_resultados: int, houve_update: bool, erro:
 
 def processar():
     # Config
-    spreadsheet_id = _env_str("PLANILHA_ID")
-    sheet_name     = _env_str("ABA_SHEETS")
+    spreadsheet_id = _env_str("PLANILHA_ID", "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q")
+    sheet_name     = _env_str("ABA_SHEETS", "Buscas")
     uasg_alvo      = _env_str("UASG_ALVO")
-    throttle_s     = _env_int("THROTTLE_SECONDS", 0)
+    throttle_s     = _env_int("THROTTLE_SECONDS", 2)
     http_timeout   = _env_int("HTTP_TIMEOUT_SECONDS", 40)
     http_ua        = _env_str("HTTP_USER_AGENT", "pncp-bot/1.0")
     dry_run        = _env_bool("DRY_RUN", False)
