@@ -56,7 +56,7 @@ COL_PRECO = "PESQUISA_PRECOS"
 UASG_ALVO = os.getenv("UASG_ALVO", "986001")
 
 # Pausa anti-bloqueio (default 5s por request) — ajuste via env THROTTLE_SECONDS
-THROTTLE_SECONDS = int(os.getenv("THROTTLE_SECONDS", "0.5"))
+THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.5"))
 
 # Timeout padrão de requests
 DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
