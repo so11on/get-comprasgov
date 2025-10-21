@@ -27,12 +27,17 @@ def read_rows_ordered(spreadsheet_id: str, tab: str,
 
     header = values[0]
     rows = values[1:]
-    max_len = max((len(r) for r in rows), default=0)
-    rows = [r + ["" * 0] * 0 for r in rows]  # no-op para manter estrutura
 
-    # normaliza largura das linhas para o tamanho do cabeçalho (H colunas)
+    # Normaliza largura até H (8 colunas)
     expected_len = max(len(header), 8)
-    rows = [r + [""] * (expected_len - len(r)) if len(r) < expected_len else r[:expected_len] for r in rows]
+    norm_rows: List[List[str]] = []
+    for r in rows:
+        r = list(r)
+        if len(r) < expected_len:
+            r = r + [""] * (expected_len - len(r))
+        elif len(r) > expected_len:
+            r = r[:expected_len]
+        norm_rows.append(r)
 
         return header.index(name) if name in header else fallback
 
@@ -49,21 +54,23 @@ def read_rows_ordered(spreadsheet_id: str, tab: str,
             return None
 
     out: List[Dict[str, Any]] = []
-    for i, r in enumerate(rows, start=2):  # dados começam na linha 2
-        item = {
+    for i, r in enumerate(norm_rows, start=2):  # dados na linha 2 em diante
+        id_compra = (r[i_id] if i_id is not None and i_id < len(r) else "").strip()
+        data_busca = (r[i_data] if i_data is not None and i_data < len(r) else "").strip()
+        status_busca = (r[i_status] if i_status is not None and i_status < len(r) else "").strip()
+        out.append({
             "row_number": i,
-            "idCompra": (r[i_id] if i_id is not None and i_id < len(r) else "").strip(),
-            "dataBusca": (r[i_data] if i_data is not None and i_data < len(r) else "").strip(),
-            "statusBusca": (r[i_status] if i_status is not None and i_status < len(r) else "").strip(),
-        }
-        out.append(item)
+            "idCompra": id_compra,
+            "dataBusca": data_busca,
+            "statusBusca": status_busca,
+        })
 
-    def key(d: Dict[str, Any]):
+    def sort_key(d: Dict[str, Any]):
         dt = parse_iso(d["dataBusca"])
-        # primeiro vazios, depois datas mais antigas primeiro
+        # 1) vazios primeiro; 2) datas válidas crescentes
         return (0 if not d["dataBusca"] else 1, dt or datetime.max.replace(tzinfo=timezone.utc))
 
-    out.sort(key=key)
+    out.sort(key=sort_key)
     return out
 
 def iso_utc_now() -> str:
