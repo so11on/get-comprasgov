@@ -28,7 +28,11 @@ def read_rows_ordered(spreadsheet_id: str, tab: str,
     header = values[0]
     rows = values[1:]
     max_len = max((len(r) for r in rows), default=0)
-    rows = [r + [""] * (max_len - len(r)) for r in rows]
+    rows = [r + ["" * 0] * 0 for r in rows]  # no-op para manter estrutura
+
+    # normaliza largura das linhas para o tamanho do cabeçalho (H colunas)
+    expected_len = max(len(header), 8)
+    rows = [r + [""] * (expected_len - len(r)) if len(r) < expected_len else r[:expected_len] for r in rows]
 
         return header.index(name) if name in header else fallback
 
@@ -44,18 +48,19 @@ def read_rows_ordered(spreadsheet_id: str, tab: str,
         except Exception:
             return None
 
-    out = []
-    for i, r in enumerate(rows, start=2):  # linha 2 em diante
+    out: List[Dict[str, Any]] = []
+    for i, r in enumerate(rows, start=2):  # dados começam na linha 2
         item = {
             "row_number": i,
-            "idCompra": (r[i_id] if i_id is not None else "").strip(),
-            "dataBusca": (r[i_data] if i_data is not None else "").strip(),
-            "statusBusca": (r[i_status] if i_status is not None else "").strip(),
+            "idCompra": (r[i_id] if i_id is not None and i_id < len(r) else "").strip(),
+            "dataBusca": (r[i_data] if i_data is not None and i_data < len(r) else "").strip(),
+            "statusBusca": (r[i_status] if i_status is not None and i_status < len(r) else "").strip(),
         }
         out.append(item)
 
-    def key(d):
+    def key(d: Dict[str, Any]):
         dt = parse_iso(d["dataBusca"])
+        # primeiro vazios, depois datas mais antigas primeiro
         return (0 if not d["dataBusca"] else 1, dt or datetime.max.replace(tzinfo=timezone.utc))
 
     out.sort(key=key)
