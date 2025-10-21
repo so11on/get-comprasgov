@@ -11,8 +11,7 @@ Atualizações:
 - Pesquisa de Preços: só é feita quando algum RESULTADO foi alterado/criado
 - Normalização canônica em comparações (ignora updatedAt, normaliza strings e números)
 """
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
 import os
 import io
 import re
@@ -57,7 +56,7 @@ COL_PRECO = "PESQUISA_PRECOS"
 UASG_ALVO = os.getenv("UASG_ALVO", "986001")
 
 # Pausa anti-bloqueio (default 5s por request) — ajuste via env THROTTLE_SECONDS
-THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
+THROTTLE_SECONDS = int(os.getenv("THROTTLE_SECONDS", "5"))
 
 # Timeout padrão de requests
 DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
@@ -706,124 +705,6 @@ def processar():
             log.error(f"HTTPError {idc}: status={getattr(e.response,'status_code',None)} body={body}")
         except Exception as e:
             log.exception(f"Falha em {idc}: {e}")
-
-# ADICIONE ESTA FUNÇÃO ANTES DE 'run_once' EM script.py
-
-def _create_retry_session() -> requests.Session:
-    """Cria uma sessão de requests com retentativas e backoff exponencial."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=2,  # Fator de backoff (ex: 2, 4, 8, 16 segundos)
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-# --- INÍCIO: adicionar ao script.py (antes do if __name__ == '__main__') ---
-
-# SUBSTITUA A FUNÇÃO 'run_once' INTEIRA EM script.py
-
-def run_once(id_compra: str) -> dict:
-    """Executa o pipeline para um único idCompra."""
-    db = build_firestore_credentials()
-    
-    # 1. Busca ITENS
-    itens_params = {'idCompra': id_compra}
-    itens_encontrados = _get_all_pages(EP_ITENS, itens_params)
-    
-    # 2. Busca RESULTADOS
-    res_params = {'idCompra': id_compra}
-    resultados_encontrados = _get_all_pages(EP_RES, res_params)
-
-    houve_modificacao = False
-    
-    # Processa e salva ITENS se houver diferença
-    if itens_encontrados:
-        docs_para_salvar = []
-        for item in itens_encontrados:
-            doc_id = f"{id_compra}_{item.get('numeroItemCompra')}"
-            if _docs_differ(db, COL_ITENS, doc_id, item):
-                docs_para_salvar.append((doc_id, item))
-                houve_modificacao = True
-        _commit_batch(db, COL_ITENS, docs_para_salvar)
-
-    # Processa e salva RESULTADOS se houver diferença
-    if resultados_encontrados:
-        docs_para_salvar = []
-        cod_itens_modificados = set()
-        for res in resultados_encontrados:
-            doc_id = f"{id_compra}_{res.get('numeroItemCompra')}"
-            if _docs_differ(db, COL_RES, doc_id, res):
-                docs_para_salvar.append((doc_id, res))
-                houve_modificacao = True
-                if res.get('codItemCatalogo'):
-                    cod_itens_modificados.add(res['codItemCatalogo'])
-        _commit_batch(db, COL_RES, docs_para_salvar)
-
-        # 3. Busca PESQUISA DE PREÇOS (CSV) apenas para itens modificados
-        if cod_itens_modificados:
-            with _create_retry_session() as session:
-                for cod_item in cod_itens_modificados:
-                    time.sleep(THROTTLE_SECONDS)
-                    
-                    # Lógica de CSV robusta integrada aqui
-                    csv_params = {'codItem': cod_item}
-                    try:
-                        response = session.get(EP_CSV, params=csv_params, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT_SECONDS)
-                        response.raise_for_status()
-                        
-                        content_bytes = response.content
-                        if not content_bytes:
-                            continue
-
-                        if content_bytes.startswith(b'\xef\xbb\xbf'):
-                            content_bytes = content_bytes[3:]
-
-                        try:
-                            text = ftfy.fix_text(charset_normalizer.from_bytes(content_bytes).best().first())
-                        except Exception:
-                            text = content_bytes.decode('latin-1', errors='replace')
-                        
-                        reader = csv.reader(io.StringIO(text), delimiter=';')
-                        
-                        header = [h.strip() for h in next(reader)]
-                        if 'codigoUasg' not in header:
-                            logging.warning(f"Coluna 'codigoUasg' não encontrada no CSV do item {cod_item}.")
-                            continue
-                        
-                        uasg_idx = header.index('codigoUasg')
-                        
-                        csv_docs_para_salvar = []
-                        for row in reader:
-                            if len(row) > uasg_idx and row[uasg_idx] == UASG_ALVO:
-                                doc_data = dict(zip(header, row))
-                                doc_id = f"{cod_item}_{doc_data.get('niFornecedor', '')}_{doc_data.get('dataRegistro', '')}"
-                                if _docs_differ(db, COL_PRECO, doc_id, doc_data):
-                                    csv_docs_para_salvar.append((doc_id, doc_data))
-                        
-                        if csv_docs_para_salvar:
-                            _commit_batch(db, COL_PRECO, csv_docs_para_salvar)
-                            houve_modificacao = True
-
-                    except StopIteration:
-                        continue # CSV vazio
-                    except requests.exceptions.RequestException as e:
-                        logging.warning(f"Falha ao buscar CSV de pesquisa de preços para item {cod_item}: {e}")
-                    except Exception as e:
-                        logging.error(f"Erro ao processar CSV para item {cod_item}: {e}")
-
-    return {
-        'id_compra': id_compra,
-        'itens_encontrados': len(itens_encontrados),
-        'resultados_encontrados': len(resultados_encontrados),
-        'houve_modificacao': houve_modificacao,
-    }
-
-# --- FIM: adicionar ao script.py ---
 
 if __name__ == "__main__":
     processar()

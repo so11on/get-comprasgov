@@ -53,4 +53,4 @@ jobs:
           GET_ALL_CHUNK: "450"
           DRY_RUN: "false"
         run: |
-          python orchestrator.py
+          python script.py
