@@ -44,8 +44,8 @@ jobs:
           FIREBASE_SA_PATH: firebase_sa.json
           GCP_SHEETS_SA_PATH: gcp_sheets_sa.json
           FIRESTORE_PROJECT_ID: get-comprasgov
-          PLANILHA_ID: ${{ secrets.PLANILHA_ID }}
-          ABA_SHEETS: ${{ secrets.ABA_SHEETS }}
+          PLANILHA_ID: 1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q
+          ABA_SHEETS: "Buscas"
           THROTTLE_SECONDS: "0.5"
           HTTP_TIMEOUT_SECONDS: "30"
           MAX_PAGES: "20"

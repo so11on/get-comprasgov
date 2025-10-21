@@ -15,55 +15,68 @@ def _get_sheets_service(sa_info_json=None, sa_file_path=None):
         raise RuntimeError("Credenciais do Google Sheets não configuradas")
     return build("sheets", "v4", credentials=creds).spreadsheets()
 
-def read_rows_ordered(spreadsheet_id: str, tab: str,
-                      sa_info_json=None, sa_file_path=None) -> List[Dict[str, Any]]:
-    svc = _get_sheets_service(sa_info_json, sa_file_path)
-    rng = f"{tab}!A:H"
-    resp = svc.values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    values = resp.get("values", [])
+# SUBSTITUA A FUNÇÃO 'read_rows_ordered' INTEIRA EM sheets_io.py
 
-    if not values:
+def read_rows_ordered(spreadsheet_id: str, tab: str, sa_info_json=None, sa_file_path=None) -> list[dict[str, any]]:
+    """Lê todas as linhas de uma aba, mapeia colunas pelo cabeçalho e ordena por dataBusca."""
+    svc = _get_sheets_service(sa_info_json=sa_info_json, sa_file_path=sa_file_path)
+    
+    # Define o range para ler a planilha inteira
+    rng = f"'{tab}'!A:H"
+    
+    try:
+        resp = svc.values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+        values = resp.get('values', [])
+    except Exception as e:
+        print(f"Erro ao acessar a planilha: {e}")
         return []
 
-    header = values[0]
-    rows = values[1:]
+    if not values:
+        print("A planilha está vazia.")
+        return []
 
-    # Normaliza largura até H (8 colunas)
-    expected_len = max(len(header), 8)
-    norm_rows: List[List[str]] = []
-    for r in rows:
-        r = list(r)
-        if len(r) < expected_len:
-            r = r + [""] * (expected_len - len(r))
-        elif len(r) > expected_len:
-            r = r[:expected_len]
-        norm_rows.append(r)
+    header = [h.strip() for h in values[0]]
+    data_rows = values[1:]
 
-        return header.index(name) if name in header else fallback
+    try:
+        # Mapeia os índices das colunas necessárias a partir do cabeçalho
+        id_compra_idx = header.index('idCompra')
+        data_busca_idx = header.index('dataBusca')
+        status_busca_idx = header.index('statusBusca')
+    except ValueError as e:
+        print(f"Erro: Coluna obrigatória não encontrada no cabeçalho: {e}. Cabeçalho encontrado: {header}")
+        return []
 
-    i_id = col_idx("idCompra", 0)          # A
-    i_data = col_idx("dataBusca", 6)       # G
-    i_status = col_idx("statusBusca", 7)   # H
+    processed_rows = []
+    for i, row in enumerate(data_rows):
+        # Garante que a linha tenha o número mínimo de colunas
+        if len(row) <= max(id_compra_idx, data_busca_idx, status_busca_idx):
+            continue
 
-    def parse_iso(s: str):
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    out: List[Dict[str, Any]] = []
-    for i, r in enumerate(norm_rows, start=2):  # dados na linha 2 em diante
-        id_compra = (r[i_id] if i_id is not None and i_id < len(r) else "").strip()
-        data_busca = (r[i_data] if i_data is not None and i_data < len(r) else "").strip()
-        status_busca = (r[i_status] if i_status is not None and i_status < len(r) else "").strip()
-        out.append({
-            "row_number": i,
-            "idCompra": id_compra,
-            "dataBusca": data_busca,
-            "statusBusca": status_busca,
+        processed_rows.append({
+            'row_num': i + 2,  # +1 para o cabeçalho, +1 para o índice baseado em 0
+            'idCompra': row[id_compra_idx],
+            'dataBusca': parse_iso(row[data_busca_idx]),
+            'statusBusca': row[status_busca_idx]
         })
+
+    # Ordena as linhas: nulas primeiro, depois por data
+    processed_rows.sort(key=lambda x: (x['dataBusca'] is None, x['dataBusca']), reverse=True)
+    
+    return processed_rows
+
+    def parse_iso(s: str) -> datetime | None:
+    """Converte string ISO 8601 para datetime, tratando o 'Z'."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        # Substitui 'Z' para compatibilidade e remove microssegundos
+        s = s.replace('Z', '+00:00')
+        if '.' in s:
+            s = s.split('.')[0]
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 
     def sort_key(d: Dict[str, Any]):
         dt = parse_iso(d["dataBusca"])
@@ -74,7 +87,8 @@ def read_rows_ordered(spreadsheet_id: str, tab: str,
     return out
 
 def iso_utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """Retorna o timestamp atual em UTC no formato ISO 8601 com 'Z'."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 def batch_write_status(spreadsheet_id: str, tab: str, updates: List[Tuple[int, str, str]],
                        sa_info_json=None, sa_file_path=None, chunk_size: int = 300):
