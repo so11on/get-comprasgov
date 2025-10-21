@@ -1,27 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-PNCP Data Pipeline: Extração, Ordenação por dataBusca, Status e Gravação no Firestore
+PNCP Data Pipeline: leitura do Google Sheets, consultas PNCP, gravação no Firestore,
+ordenação por dataBusca, carimbo de data/hora e status na planilha.
 
-Atualizações implementadas:
-1) Escrever data/hora da última consulta na coluna G (cabeçalho: "dataBusca").
-2) Processar em ordem: primeiro linhas com "dataBusca" em branco; depois por "dataBusca" crescente (mais antiga -> mais nova).
-3) Escrever na coluna H (cabeçalho: "statusBusca") um resumo da busca:
+Atendido:
+1) Escrever na coluna "dataBusca" a data/hora da última consulta.
+2) Processar em ordem: primeiro dataBusca em branco; depois por dataBusca crescente.
+3) Escrever na coluna "statusBusca" o resumo:
    - "X itens encontrados; X resultados encontrados; Sem modificações desde a última busca"
    - ou "X itens encontrados; X resultados encontrados; Dados atualizados no Banco"
-   - Em caso de erro: "Erro: <mensagem resumida>"
+   - ou "Erro: <mensagem>"
 
-Pré-requisitos (variáveis de ambiente):
-- PLANILHA_ID, ABA_SHEETS
-- UASG_ALVO (opcional)
-- THROTTLE_SECONDS (opcional), HTTP_TIMEOUT_SECONDS (opcional), HTTP_USER_AGENT (opcional)
-- DRY_RUN ("true" para não gravar no Firestore)
-- Credenciais Google Sheets: GCP_SHEETS_SA_JSON (conteúdo) ou GCP_SHEETS_SA_PATH (arquivo)
-- Credenciais Firestore: FIREBASE_SA_JSON (conteúdo) ou FIREBASE_SA_PATH (arquivo), FIRESTORE_PROJECT_ID
+Detecção de colunas por nome de cabeçalho (case-insensitive):
+- "idCompra"
+- "dataBusca"
+- "statusBusca"
 
-Observações:
-- Coluna G = índice 7; Coluna H = índice 8.
-- A planilha possui cabeçalho na linha 1.
-- A ordenação é feita em memória; a planilha não é reordenada visualmente.
+Defaults (sobrescreva via variáveis de ambiente):
+- PLANILHA_ID = 1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q
+- ABA_SHEETS  = Buscas
 """
 
 import os
@@ -39,23 +36,24 @@ from googleapiclient.discovery import build
 import google.cloud.firestore_v1 as firestore
 
 # ---------------------------
-# Configurações
+# Config
 # ---------------------------
 
-ID_RE = re.compile(r'^\d{17}$')  # ajuste se seu idCompra tiver outro formato
 DEFAULT_TZ = "America/Sao_Paulo"
 
+# Endpoints PNCP (ajuste se necessário)
 BASE = "https://pncp.gov.br/api"
 EP_ITENS = f"{BASE}/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id"
 EP_RES   = f"{BASE}/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id"
 EP_CSV   = f"{BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
 
-COL_IDCOMPRA    = 1  # A
-COL_DATA_BUSCA  = 7  # G
-COL_STATUS      = 8  # H
+# Nomes de cabeçalho a localizar
+HDR_IDCOMPRA   = "idCompra"
+HDR_DATABUSCA  = "dataBusca"
+HDR_STATUS     = "statusBusca"
 
 # ---------------------------
-# Utilitários
+# Utils
 # ---------------------------
 
 def _env_str(name: str, default: t.Optional[str] = None) -> t.Optional[str]:
@@ -227,7 +225,7 @@ def documentos_diferem(a: dict, b: dict) -> bool:
     return normalizar_documento(a) != normalizar_documento(b)
 
 # ---------------------------
-# Persistência Firestore
+# Firestore upserts
 # ---------------------------
 
 def upsert_itens(db: firestore.Client, itens: list[dict], dry_run: bool):
@@ -278,7 +276,7 @@ def upsert_pesquisa_precos(db: firestore.Client, docs: list[dict], dry_run: bool
         batch.commit()
 
 # ---------------------------
-# CSV -> objetos (placeholder simples)
+# CSV -> objetos (mínimo)
 # ---------------------------
 
 def parse_pesquisa_csv(csv_text: str, uasg_alvo: str | None) -> list[dict]:
@@ -292,27 +290,69 @@ def parse_pesquisa_csv(csv_text: str, uasg_alvo: str | None) -> list[dict]:
     return rows
 
 # ---------------------------
-# Sheets: leitura ordenada e escrita G/H
+# Sheets: mapeamento por cabeçalho, leitura ordenada, escrita de G/H por nome
 # ---------------------------
 
-def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str) -> list[dict]:
-    range_all = f"{sheet_name}!A1:Z"
+def _mapear_colunas_por_nome(header: list[t.Any]) -> dict:
+    """
+    Retorna dict com índices 1-based das colunas:
+      - id_col
+      - data_col
+      - status_col
+    Busca por nome case-insensitive. Lança erro se não encontrar.
+    """
+    if not header:
+        raise RuntimeError("Cabeçalho da planilha ausente.")
+
+    name_to_idx = {}
+    for idx, nome in enumerate(header, start=1):
+        key = str(nome).strip().lower() if nome is not None else ""
+        if key:
+            name_to_idx[key] = idx
+
+    def achar(nome_alvo: str) -> int:
+        k = nome_alvo.strip().lower()
+        if k not in name_to_idx:
+            raise RuntimeError(f"Coluna '{nome_alvo}' não encontrada no cabeçalho.")
+        return name_to_idx[k]
+
+    return {
+        "id_col": achar(HDR_IDCOMPRA),
+        "data_col": achar(HDR_DATABUSCA),
+        "status_col": achar(HDR_STATUS),
+    }
+
+def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str, id_regex: t.Optional[re.Pattern]):
+    range_all = f"{sheet_name}!A1:ZZ"
     values = sheets_read_range(svc, spreadsheet_id, range_all)
     if not values:
-        return []
-    header = values[0]
-    data = values[1:]
+        print("[Sheets] Leitura vazia da planilha.")
+        return [], None
 
+    header = values[0]
+    cols = _mapear_colunas_por_nome(header)
+    id_col     = cols["id_col"]
+    data_col   = cols["data_col"]
+    status_col = cols["status_col"]
+
+    data = values[1:]
     registros = []
     for i, row in enumerate(data, start=2):
-        while len(row) < max(COL_DATA_BUSCA, COL_STATUS):
-            row.append("")
-        raw_id = row[COL_IDCOMPRA - 1] if len(row) >= COL_IDCOMPRA else ""
-        id_compra = str(raw_id).strip()
-        if not id_compra or not ID_RE.match(id_compra):
+        # Normalize comprimento da linha
+        faltam = max(id_col, data_col, status_col) - len(row)
+        if faltam > 0:
+            row = row + [""] * faltam
+
+        raw_id = row[id_col - 1]
+        id_compra = str(raw_id).strip() if raw_id is not None else ""
+        if not id_compra:
             continue
-        data_busca_raw = row[COL_DATA_BUSCA - 1]
+        if id_regex and not id_regex.match(id_compra):
+            continue
+
+        data_busca_raw = row[data_col - 1] if len(row) >= data_col else ""
         data_busca_dt = parse_data_busca(data_busca_raw)
+
         registros.append({
             "row_index": i,
             "idCompra": id_compra,
@@ -320,15 +360,22 @@ def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str) -> li
             "dataBusca_dt": data_busca_dt
         })
 
-    # Ordenar: vazios primeiro, depois por data asc
+    # Ordenar: dataBusca vazia primeiro, depois dataBusca asc
     registros.sort(key=lambda it: (
         0 if it["dataBusca_dt"] is None else 1,
         it["dataBusca_dt"] or datetime.max.replace(tzinfo=timezone.utc)
     ))
-    return registros
 
-def escrever_stamp_e_status(svc, spreadsheet_id: str, sheet_name: str, row_index: int, ts_str: str, status: str):
-    rng = a1_range(sheet_name, row_index, COL_DATA_BUSCA, row_index, COL_STATUS)  # G:H daquela linha
+    print(f"[Sheets] Colunas: id={id_col}, dataBusca={data_col}, statusBusca={status_col}. Linhas elegíveis={len(registros)}")
+    return registros, cols
+
+def escrever_stamp_e_status(svc, spreadsheet_id: str, sheet_name: str, row_index: int, cols: dict, ts_str: str, status: str):
+    """
+    Escreve timestamp em dataBusca e mensagem em statusBusca.
+    """
+    data_col   = cols["data_col"]
+    status_col = cols["status_col"]
+    rng = a1_range(sheet_name, row_index, data_col, row_index, status_col)
     sheets_write_range(svc, spreadsheet_id, rng, [[ts_str, status]])
 
 # ---------------------------
@@ -343,30 +390,36 @@ def compor_status(qtd_itens: int, qtd_resultados: int, houve_update: bool, erro:
     return base + ("Dados atualizados no Banco" if houve_update else "Sem modificações desde a última busca")
 
 # ---------------------------
-# Processo principal
+# Principal
 # ---------------------------
 
 def processar():
-    # Config
+    # Defaults exigidos pelo usuário
     spreadsheet_id = _env_str("PLANILHA_ID", "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q")
     sheet_name     = _env_str("ABA_SHEETS", "Buscas")
+
     uasg_alvo      = _env_str("UASG_ALVO")
-    throttle_s     = _env_int("THROTTLE_SECONDS", 2)
+    throttle_s     = _env_int("THROTTLE_SECONDS", 0)
     http_timeout   = _env_int("HTTP_TIMEOUT_SECONDS", 40)
     http_ua        = _env_str("HTTP_USER_AGENT", "pncp-bot/1.0")
     dry_run        = _env_bool("DRY_RUN", False)
+    id_regex_env   = _env_str("IDCOMPRA_REGEX")  # opcional
+    id_regex       = re.compile(id_regex_env) if id_regex_env else None
 
-    if not spreadsheet_id or not sheet_name:
-        raise RuntimeError("Defina PLANILHA_ID e ABA_SHEETS.")
+    print("[Init] Iniciando processamento PNCP.")
+    print(f"[Env] PLANILHA_ID={spreadsheet_id!r} ABA_SHEETS={sheet_name!r} DRY_RUN={dry_run}")
 
-    # Serviços
     svc = build_sheets_service()
+    print("[Sheets] Serviço Google Sheets inicializado.")
     db  = build_firestore_client()
+    print("[Firestore] Cliente Firestore inicializado.")
 
-    # Lê linhas ordenadas conforme regra
-    filas = ler_dados_planilha_ordenado(svc, spreadsheet_id, sheet_name)
+    filas, cols = ler_dados_planilha_ordenado(svc, spreadsheet_id, sheet_name, id_regex)
+    if not filas:
+        print("[Processo] Nenhuma linha elegível encontrada. Encerrando.")
+        return
 
-    for item in filas:
+    for n, item in enumerate(filas, start=1):
         row_idx   = item["row_index"]
         id_compra = item["idCompra"]
 
@@ -378,35 +431,38 @@ def processar():
         houve_upd = False
         status    = ""
 
+        print(f"[Exec] ({n}/{len(filas)}) idCompra={id_compra} linha={row_idx}")
+
         try:
-            # 1) Itens
+            # Itens
             js_itens = consultar_itens(id_compra, timeout=http_timeout, ua=http_ua)
             itens = js_itens if isinstance(js_itens, list) else js_itens.get("itens") or js_itens.get("content") or []
             qtd_itens = len(itens) if itens else 0
+            print(f"[API] Itens={qtd_itens}")
 
-            # 2) Resultados
+            # Resultados
             js_res = consultar_resultados(id_compra, timeout=http_timeout, ua=http_ua)
             resultados = js_res if isinstance(js_res, list) else js_res.get("resultados") or js_res.get("content") or []
             qtd_res = len(resultados) if resultados else 0
+            print(f"[API] Resultados={qtd_res}")
 
-            # Persistências
+            # Firestore
             upsert_itens(db, itens, dry_run=dry_run)
             houve_upd = upsert_resultados(db, resultados, dry_run=dry_run)
+            print(f"[DB] RESULTADOS atualizados={houve_upd}")
 
-            # 3) Opcional: pesquisa de preços quando houve atualização de resultados
+            # Pesquisa de preços (opcional) quando houve atualização
             if houve_upd:
-                # Exemplo mínimo: se tiver codigoMaterial em itens, pega o primeiro
                 cod_mats = []
                 for it in itens or []:
-                    cm = it.get("codigoMaterial") or it.get("codigoItem") or None
+                    cm = it.get("codigoMaterial") or it.get("codigoItem")
                     if cm:
                         cod_mats.append(str(cm))
-                cod_mats = list(dict.fromkeys(cod_mats))  # únicos, mantendo ordem
+                cod_mats = list(dict.fromkeys(cod_mats))  # únicos
                 docs_pesquisa = []
-                for cm in cod_mats[:3]:  # limite de segurança
+                for cm in cod_mats[:3]:
                     csv_txt = consultar_pesquisa_csv(cm, timeout=http_timeout, ua=http_ua)
                     linhas = parse_pesquisa_csv(csv_txt, uasg_alvo)
-                    # Anexe metadados mínimos
                     for ln in linhas:
                         ln["idCompra"] = id_compra
                         ln["numeroItemCompra"] = ln.get("numeroItemCompra") or ln.get("numeroItemPncp") or ""
@@ -414,20 +470,26 @@ def processar():
                     if throttle_s:
                         time.sleep(throttle_s)
                 upsert_pesquisa_precos(db, docs_pesquisa, dry_run=dry_run)
+                print(f"[DB] Pesquisa de preços gravada={len(docs_pesquisa)}")
 
             status = compor_status(qtd_itens, qtd_res, houve_upd, erro=None)
 
         except requests.HTTPError as he:
-            status = compor_status(qtd_itens, qtd_res, houve_upd, erro=f"HTTP {he.response.status_code}")
+            code = he.response.status_code if he.response is not None else "HTTP"
+            status = compor_status(qtd_itens, qtd_res, houve_upd, erro=f"HTTP {code}")
+            print(f"[Erro] HTTP {code} em idCompra={id_compra}")
         except Exception as e:
             status = compor_status(qtd_itens, qtd_res, houve_upd, erro=str(e))
+            print(f"[Erro] Exceção em idCompra={id_compra}: {e}")
 
-        # Escreve G (dataBusca) e H (statusBusca) na linha correspondente
+        # Escrever dataBusca/statusBusca pelas colunas detectadas
         try:
-            escrever_stamp_e_status(svc, spreadsheet_id, sheet_name, row_idx, ts_str, status)
+            escrever_stamp_e_status(svc, spreadsheet_id, sheet_name, row_idx, cols, ts_str, status)
         finally:
             if throttle_s:
                 time.sleep(throttle_s)
+
+    print("[Fim] Processamento concluído.")
 
 # Execução direta
 if __name__ == "__main__":
