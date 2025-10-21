@@ -12,3 +12,5 @@ pandas>=2.2.2
 urllib3>=2.2.0
 python-dateutil>=2.9.0.post0
 httplib2>=0.22.0
+gspread>=6.0.2
+gspread-dataframe>=3.4.2
