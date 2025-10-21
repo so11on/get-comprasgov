@@ -1,473 +1,754 @@
 # -*- coding: utf-8 -*-
 """
-PNCP Data Pipeline: leitura do Google Sheets (Buscas), consultas PNCP, gravação no Firestore,
-ordenação por dataBusca, carimbo de data/hora e status na planilha, com escrita em lote.
+Pipeline PNCP -> Firestore
+- Lê idCompra do Google Sheets (aba 'Buscas', coluna 'idCompra')
+- Busca 2.1 (Itens) e 3.1 (Resultados)
+- Salva nas coleções: ITENS, RESULTADOS, PESQUISA_PRECOS
+- RESULTADOS NÃO recebe campo 'marca' (apenas em PESQUISA_PRECOS)
 
-Atende:
-1) Escrever em "dataBusca" a data/hora da última consulta.
-2) Processar em ordem: primeiro dataBusca vazia; depois dataBusca crescente.
-3) Escrever em "statusBusca" o resumo da busca.
-4) Corrige erro: name 'http_get' is not defined (função reintroduzida).
-5) Evita 429 no Sheets: usa values.batchUpdate com retry/backoff.
-
-Defaults exigidos:
-- PLANILHA_ID = 1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q
-- ABA_SHEETS  = Buscas
-- Cabeçalhos: idCompra, dataBusca, statusBusca (case-insensitive)
+Atualizações:
+- Upsert condicional: só grava quando houver diferença real (evita writes desnecessários)
+- Pesquisa de Preços: só é feita quando algum RESULTADO foi alterado/criado
+- Normalização canônica em comparações (ignora updatedAt, normaliza strings e números)
 """
 
 import os
 import io
 import re
-import csv
 import json
 import time
-import typing as t
-from datetime import datetime, timezone
+import logging
+from typing import Any, Dict, List, Optional, Set, Iterable, Tuple
+from decimal import Decimal, InvalidOperation
 
+import pandas as pd
 import requests
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import google.cloud.firestore_v1 as firestore
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import csv as pycsv
 
-# ---------------------------
-# Config
-# ---------------------------
+import gspread
+from google.oauth2.service_account import Credentials
+from google.cloud import firestore
 
-DEFAULT_TZ = "America/Sao_Paulo"
+# === Correção robusta de encoding (CSV) ===
+from charset_normalizer import from_bytes
+from ftfy import fix_text
 
-BASE = "https://pncp.gov.br/api"
+# ================= CONFIG =================
+# Use ENV para substituir defaults
+PLANILHA_ID_DEFAULT = "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q"
+ABA_SHEETS_DEFAULT = "Buscas"
+
+PLANILHA_ID = os.getenv("PLANILHA_ID", PLANILHA_ID_DEFAULT)
+ABA_SHEETS = os.getenv("ABA_SHEETS", ABA_SHEETS_DEFAULT)
+
+BASE = "https://dadosabertos.compras.gov.br"
 EP_ITENS = f"{BASE}/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id"
 EP_RES   = f"{BASE}/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id"
 EP_CSV   = f"{BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
 
-HDR_IDCOMPRA   = "idCompra"
-HDR_DATABUSCA  = "dataBusca"
-HDR_STATUS     = "statusBusca"
+COL_ITENS = "ITENS"
+COL_RES   = "RESULTADOS"
+COL_PRECO = "PESQUISA_PRECOS"
 
-# ---------------------------
-# Utils
-# ---------------------------
+# UASG alvo para filtrar linhas do CSV (coluna 'codigoUasg')
+UASG_ALVO = os.getenv("UASG_ALVO", "986001")
 
-def _env_str(name: str, default: t.Optional[str] = None) -> t.Optional[str]:
-    v = os.getenv(name)
-    return v if (v is not None and v != "") else default
+# Pausa anti-bloqueio (default 5s por request) — ajuste via env THROTTLE_SECONDS
+THROTTLE_SECONDS = int(os.getenv("THROTTLE_SECONDS", "5"))
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y")
+# Timeout padrão de requests
+DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
 
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
+# User-Agent identificável
+UA = os.getenv("HTTP_USER_AGENT", "pncp-sync/1.0 (+contato: seu-email@dominio)")
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+# DRY_RUN: não grava no Firestore quando true
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-def format_ts_local(dt_utc: datetime, tz_name: str = DEFAULT_TZ) -> str:
-    from zoneinfo import ZoneInfo
-    dt_local = dt_utc.astimezone(ZoneInfo(tz_name))
-    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+# Limites de segurança
+MAX_PAGES = int(os.getenv("MAX_PAGES", "200"))
+BATCH_CHUNK_SIZE = int(os.getenv("BATCH_CHUNK_SIZE", "450"))
+GET_ALL_CHUNK = int(os.getenv("GET_ALL_CHUNK", "300"))
 
-def parse_data_busca(value: t.Any) -> t.Optional[datetime]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    s = str(value).strip()
-    if not s:
-        return None
-    from zoneinfo import ZoneInfo
-    tz = ZoneInfo(DEFAULT_TZ)
-    try:
-        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=tz)
-        return d.astimezone(timezone.utc)
-    except Exception:
-        pass
-    fmts = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
-        "%d/%m/%Y",
+# ================= CAMPOS CANÔNICOS =================
+# ITENS: exatamente os campos especificados
+ITENS_KEEP = {
+    "idCompra",
+    "idCompraItem",
+    "idContratacaoPNCP",
+    "unidadeOrgaoCodigoUnidade",
+    "orgaoEntidadeCnpj",
+    "numeroItemPncp",
+    "numeroItemCompra",
+    "numeroGrupo",
+    "descricaoResumida",
+    "materialOuServicoNome",
+    "codigoClasse",
+    "codigoGrupo",
+    "codItemCatalogo",
+    "descricaodetalhada",
+    "unidadeMedida",
+    "situacaoCompraItemNome",
+    "tipoBeneficioNome",
+    "quantidade",
+    "valorUnitarioEstimado",
+    "valorTotal",
+    "temResultado",
+    "codFornecedor",
+    "nomeFornecedor",
+    "quantidadeResultado",
+    "valorUnitarioResultado",
+    "valorTotalResultado",
+    "dataResultado",
+    "numeroControlePNCPCompra",
+}
+
+# RESULTADOS: exatamente os campos especificados
+RESULTADOS_KEEP = {
+    "idCompraItem",
+    "idCompra",
+    "idContratacaoPNCP",
+    "unidadeOrgaoCodigoUnidade",
+    "numeroItemPncp",
+    "sequencialResultado",
+    "niFornecedor",
+    "tipoPessoa",
+    "nomeRazaoSocialFornecedor",
+    "ordemClassificacaoSrp",
+    "quantidadeHomologada",
+    "valorUnitarioHomologado",
+    "valorTotalHomologado",
+    "percentualDesconto",
+    "situacaoCompraItemResultadoNome",
+    "porteFornecedorNome",
+    "naturezaJuridicaNome",
+    "dataInclusaoPncp",
+    "dataAtualizacaoPncp",
+    "dataCancelamentoPncp",
+    "dataResultadoPncp",
+    "numeroControlePNCPCompra",
+    "aplicacaoBeneficioMeepp",
+    "aplicacaoCriterioDesempate",
+    "amparoLegalCriterioDesempateNome",
+    "moedaEstrangeiraId",
+    "dataCotacaoMoedaEstrangeira",
+    "valorNominalMoedaEstrangeira",
+    "paisOrigemProdutoServicoId",
+}
+
+# PESQUISA_PRECOS: mapear CSV -> chaves canônicas (armazenar só essas)
+PRECO_FIELD_CANDIDATES: Dict[str, List[str]] = {
+    "idCompra": ["idCompra", "id_compra"],
+    "idItemCompra": ["idItemCompra", "id_item_compra", "idItem", "idItemPncp"],
+    "modalidade": ["modalidade", "Modalidade"],
+    "numeroItemCompra": ["numeroItemCompra", "numero_item_compra", "numeroItemPncp", "nItem"],
+    "descricaoItem": ["descricaoItem", "descricao_item", "descricao", "descricaoResumida"],
+    "codigoItemCatalogo": ["codigoItemCatalogo", "codItemCatalogo", "codigo_item_catalogo"],
+    "siglaUnidadeMedida": ["siglaUnidadeMedida", "sigla_unidade_medida", "siglaUnidade", "siglaUnidMedida"],
+    "nomeUnidadeFornecimento": ["nomeUnidadeFornecimento", "nome_unidade_fornecimento"],
+    "siglaUnidadeFornecimento": ["siglaUnidadeFornecimento", "sigla_unidade_fornecimento"],
+    "quantidade": ["quantidade", "qtde", "qtd"],
+    "precoUnitario": ["precoUnitario", "preco_unitario", "valorUnitario"],
+    "percentualMaiorDesconto": ["percentualMaiorDesconto", "percMaiorDesconto"],
+    "niFornecedor": ["niFornecedor", "cnpjCpfFornecedor", "cnpjFornecedor"],
+    "nomeFornecedor": ["nomeFornecedor", "razaoSocialFornecedor", "fornecedor"],
+    "marca": ["marca", "Marca"],
+    "codigoUasg": ["codigoUasg", "codigo_uasg", "uasg", "codigoUASG"],
+    "nomeUasg": ["nomeUasg", "NomeUasg"],
+    "municipio": ["municipio", "Município", "cidade"],
+    "dataCompra": ["dataCompra", "data_compra"],
+    "dataHoraAtualizacaoCompra": ["dataHoraAtualizacaoCompra", "dtHrAtualizacaoCompra"],
+    "dataHoraAtualizacaoItem": ["dataHoraAtualizacaoItem", "dtHrAtualizacaoItem"],
+    "dataResultado": ["dataResultado", "data_resultado"],
+    "dataHoraAtualizacaoUasg": ["dataHoraAtualizacaoUasg", "dtHrAtualizacaoUasg"],
+    "codigoClasse": ["codigoClasse", "codClasse"],
+}
+
+# ================= LOG =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("pncp-sync")
+
+# ============== Credenciais (Sheets x Firestore) ==============
+def build_sheets_credentials() -> Credentials:
+    """
+    Lê credenciais do Sheets de:
+    - GCP_SHEETS_SA_JSON (conteúdo JSON) OU
+    - GCP_SHEETS_SA_PATH (caminho do arquivo JSON escrito pelo workflow)
+    Escopos readonly.
+    """
+    sa_json = os.getenv("GCP_SHEETS_SA_JSON")
+    sa_path = os.getenv("GCP_SHEETS_SA_PATH")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
     ]
-    for fmt in fmts:
+    if sa_json:
+        info = json.loads(sa_json)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    if sa_path:
+        return Credentials.from_service_account_file(sa_path, scopes=scopes)
+    raise RuntimeError("Defina GCP_SHEETS_SA_JSON ou GCP_SHEETS_SA_PATH para Sheets.")
+
+def build_firestore_credentials() -> Credentials:
+    """
+    Lê credenciais do Firestore de:
+    - FIREBASE_SA_JSON (conteúdo JSON) OU
+    - FIREBASE_SA_PATH (caminho do arquivo JSON escrito pelo workflow)
+    Sem escopos.
+    """
+    sa_json = os.getenv("FIREBASE_SA_JSON")
+    sa_path = os.getenv("FIREBASE_SA_PATH")
+    if sa_json:
+        info = json.loads(sa_json)
+        return Credentials.from_service_account_info(info)
+    if sa_path:
+        return Credentials.from_service_account_file(sa_path)
+    raise RuntimeError("Defina FIREBASE_SA_JSON ou FIREBASE_SA_PATH para Firestore.")
+
+def make_firestore_client(creds: Credentials) -> firestore.Client:
+    project = os.getenv("FIRESTORE_PROJECT_ID", None)
+    if not project:
+        raise RuntimeError("Defina FIRESTORE_PROJECT_ID (ex.: get-comprasgov).")
+    return firestore.Client(project=project, credentials=creds)
+
+def make_sheets_client(creds: Credentials) -> gspread.Client:
+    return gspread.authorize(creds)
+
+# ============== HTTP com retry + throttle ==============
+_last_call = 0.0
+def throttle():
+    global _last_call
+    now = time.time()
+    delta = now - _last_call
+    if delta < THROTTLE_SECONDS:
+        time.sleep(max(0, THROTTLE_SECONDS - delta))
+    _last_call = time.time()
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+def get_json(session: requests.Session, url: str, params: Dict[str, Any]) -> Any:
+    throttle()
+    r = session.get(
+        url,
+        params=params,
+        headers={"Accept": "application/json", "User-Agent": UA},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def get_bytes(session: requests.Session, url: str, params: Dict[str, Any]) -> bytes:
+    throttle()
+    r = session.get(
+        url,
+        params=params,
+        headers={"Accept": "text/csv, */*", "User-Agent": UA},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.content
+
+# ============== Helpers de normalização/comparação ==============
+def normalize_str(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s or None
+
+def only_fields(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if k in keep}
+
+def pick_num_item_pncp_or_compra(obj: Dict[str, Any]) -> Optional[str]:
+    return normalize_str(obj.get("numeroItemPncp")) or normalize_str(obj.get("numeroItemCompra"))
+
+def _to_decimal_or_str(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, (int, float, Decimal)):
         try:
-            d = datetime.strptime(s, fmt)
-            d = d.replace(tzinfo=tz)
-            return d.astimezone(timezone.utc)
+            return Decimal(str(x))
+        except InvalidOperation:
+            return str(x)
+    s = str(x).strip()
+    if re.match(r"^-?\d+[.,]\d+$", s):
+        s = s.replace(",", ".")
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return s or None
+
+def _normalize_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s != "" else None
+    if isinstance(v, (int, float, Decimal)):
+        return _to_decimal_or_str(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, list):
+        return [_normalize_value(i) for i in v]
+    if isinstance(v, dict):
+        return {k: _normalize_value(vv) for k, vv in v.items()}
+    return v
+
+def _canonical_doc(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    base = only_fields(d, keep)
+    base.pop("updatedAt", None)
+    norm = {k: _normalize_value(v) for k, v in base.items()}
+    return {k: v for k, v in norm.items() if v is not None}
+
+def _docs_differ(local_payload: Dict[str, Any], remote_doc: Optional[Dict[str, Any]], keep: set) -> bool:
+    left = _canonical_doc(local_payload, keep)
+    right = _canonical_doc(remote_doc or {}, keep)
+    return left != right
+
+# ============== OCR/CSV decodificação e parsing ==============
+def _decode_csv_bytes(raw: bytes) -> str:
+    """
+    Decodifica os bytes do CSV sem perder acentos:
+    - detecta encoding com charset-normalizer (sem 'ignore')
+    - ftfy para consertar mojibake
+    - fallback para latin-1/cp1252
+    """
+    try:
+        probe = from_bytes(raw).best()
+        if probe and probe.encoding:
+            decoded_main = raw.decode(probe.encoding, errors="strict")
+        else:
+            decoded_main = raw.decode("utf-8", errors="strict")
+    except Exception:
+        try:
+            decoded_main = raw.decode("latin-1", errors="strict")
         except Exception:
-            continue
+            decoded_main = raw.decode("cp1252", errors="strict")
+
+    fixed_main = fix_text(decoded_main)
+
+    def score_bad(s: str) -> int:
+        return sum(s.count(ch) for ch in ("Ã", "Â"))
+
+    if score_bad(fixed_main) > 0:
+        try:
+            alt = decoded_main.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+            alt_fixed = fix_text(alt)
+            if score_bad(alt_fixed) < score_bad(fixed_main):
+                fixed_main = alt_fixed
+        except Exception:
+            pass
+
+    return fixed_main
+
+def _read_csv_bytes_to_df(raw: bytes) -> pd.DataFrame:
+    decoded = _decode_csv_bytes(raw)
+    sample = decoded[:4096]
+    try:
+        dialect = pycsv.Sniffer().sniff(sample, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        sep = ";"
+    df = pd.read_csv(io.StringIO(decoded), sep=sep, dtype=str, na_filter=False, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    df.attrs["_lower_map"] = {c.lower(): c for c in df.columns}
+    return df
+
+def _get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    lower_map = df.attrs.get("_lower_map", {c.lower(): c for c in df.columns})
+    for c in candidates:
+        real = lower_map.get(c.lower())
+        if real:
+            return real
     return None
 
-# Reintroduzido: http_get ausente em versões anteriores
-    headers = {}
-    if ua:
-        headers["User-Agent"] = ua
-    return requests.get(url, params=params or {}, headers=headers, timeout=timeout)
-
-# ---------------------------
-# Google Sheets
-# ---------------------------
-
-def build_sheets_service():
-    path = _env_str("GCP_SHEETS_SA_PATH")
-    content = _env_str("GCP_SHEETS_SA_JSON")
-    if not path and not content:
-        raise RuntimeError("Credencial para Sheets ausente: defina GCP_SHEETS_SA_PATH ou GCP_SHEETS_SA_JSON.")
-    if content:
-        info = json.loads(content)
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-    else:
-        creds = service_account.Credentials.from_service_account_file(
-            path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-def sheets_read_range(svc, spreadsheet_id: str, range_a1: str) -> list[list[t.Any]]:
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=range_a1,
-        valueRenderOption="UNFORMATTED_VALUE",
-        dateTimeRenderOption="FORMATTED_STRING",
-    ).execute()
-    return res.get("values", [])
-
-def batch_update_values_with_retry(svc, spreadsheet_id: str, data_payload: list[dict], value_input_option: str = "RAW", max_retries: int = 5):
-    if not data_payload:
-        return
-    body = {
-        "valueInputOption": value_input_option,
-        "data": data_payload
-    }
-    delay = 1.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            svc.spreadsheets().values().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=body
-            ).execute()
-            return
-        except HttpError as e:
-            status = getattr(e, "status_code", None)
-            if status is None and hasattr(e, "resp") and hasattr(e.resp, "status"):
-                status = e.resp.status
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
-                time.sleep(delay)
-                delay = min(delay * 2, 16)
-                continue
-            raise
-
-def a1_range(sheet_name: str, start_row: int, start_col: int, end_row: int, end_col: int) -> str:
-    def col_to_a(n: int) -> str:
-        s = ""
-        while n > 0:
-            n, r = divmod(n - 1, 26)
-            s = chr(65 + r) + s
-        return s
-    return f"{sheet_name}!{col_to_a(start_col)}{start_row}:{col_to_a(end_col)}{end_row}"
-
-# ---------------------------
-# Firestore
-# ---------------------------
-
-def build_firestore_client():
-    path = _env_str("FIREBASE_SA_PATH")
-    content = _env_str("FIREBASE_SA_JSON")
-    project_id = _env_str("FIRESTORE_PROJECT_ID")
-    if not path and not content:
-        raise RuntimeError("Credencial para Firestore ausente: defina FIREBASE_SA_PATH ou FIREBASE_SA_JSON.")
-    if not project_id:
-        raise RuntimeError("Defina FIRESTORE_PROJECT_ID.")
-    if content:
-        info = json.loads(content)
-        creds = service_account.Credentials.from_service_account_info(info)
-    else:
-        creds = service_account.Credentials.from_service_account_file(path)
-    return firestore.Client(project=project_id, credentials=creds)
-
-# ---------------------------
-# PNCP API
-# ---------------------------
-
-def consultar_itens(id_compra: str, timeout: int, ua: str | None) -> dict:
-    r = http_get(EP_ITENS, params={"idCompra": id_compra}, timeout=timeout, ua=ua)
-    r.raise_for_status()
-    return r.json()
-
-def consultar_resultados(id_compra: str, timeout: int, ua: str | None) -> dict:
-    r = http_get(EP_RES, params={"idCompra": id_compra}, timeout=timeout, ua=ua)
-    r.raise_for_status()
-    return r.json()
-
-def consultar_pesquisa_csv(codigo_material: str, timeout: int, ua: str | None) -> str:
-    r = http_get(EP_CSV, params={"codigoMaterial": codigo_material}, timeout=timeout, ua=ua)
-    r.raise_for_status()
-    return r.text
-
-# ---------------------------
-# Normalização/Comparação
-# ---------------------------
-
-def normalizar_documento(d: dict) -> dict:
-    x = dict(d or {})
-    x.pop("updatedAt", None)
-    return x
-
-def documentos_diferem(a: dict, b: dict) -> bool:
-    return normalizar_documento(a) != normalizar_documento(b)
-
-# ---------------------------
-# Firestore upserts
-# ---------------------------
-
-def upsert_itens(db: firestore.Client, itens: list[dict], dry_run: bool):
-    if not itens:
-        return
-    batch = db.batch()
-    for it in itens:
-        doc_id = f"{it.get('idCompra')}-{it.get('numeroItemPncp')}"
-        ref = db.collection("ITENS").document(doc_id)
-        if not dry_run:
-            batch.set(ref, it, merge=True)
-    if not dry_run:
-        batch.commit()
-
-def upsert_resultados(db: firestore.Client, resultados: list[dict], dry_run: bool) -> bool:
-    houve_update = False
-    if not resultados:
-        return False
-    batch = db.batch()
-    for r in resultados:
-        doc_id = f"{r.get('idCompra')}-{r.get('numeroItemPncp')}-{r.get('niFornecedor')}"
-        ref = db.collection("RESULTADOS").document(doc_id)
-        snap = ref.get()
-        if snap.exists:
-            atual = snap.to_dict()
-            if documentos_diferem(atual, r):
-                houve_update = True
-                if not dry_run:
-                    batch.set(ref, r, merge=True)
+def _row_to_precos_payload(row: Dict[str, Any], colmap: Dict[str, str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for target_key, real_col in colmap.items():
+        if real_col:
+            val = row.get(real_col)
+            out[target_key] = None if (val is None or str(val).strip() == "") else str(val).strip()
         else:
-            houve_update = True
-            if not dry_run:
-                batch.set(ref, r, merge=True)
-    if not dry_run:
-        batch.commit()
-    return houve_update
+            out[target_key] = None
+    return out
 
-def upsert_pesquisa_precos(db: firestore.Client, docs: list[dict], dry_run: bool):
-    if not docs:
+# ============== Firestore utils (chunks e leitura em lote) ==============
+def _commit_in_chunks(writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]], db: firestore.Client, chunk_size: int = BATCH_CHUNK_SIZE):
+    if DRY_RUN or not writes:
         return
-    batch = db.batch()
-    for d in docs:
-        doc_id = f"{d.get('idCompra')}-{d.get('numeroItemCompra')}"
-        ref = db.collection("PESQUISA_PRECOS").document(doc_id)
-        if not dry_run:
-            batch.set(ref, d, merge=True)
-    if not dry_run:
+    for i in range(0, len(writes), chunk_size):
+        batch = db.batch()
+        for ref, payload in writes[i:i+chunk_size]:
+            batch.set(ref, payload, merge=True)
         batch.commit()
 
-# ---------------------------
-# CSV -> objetos
-# ---------------------------
+def _get_all_chunked(db: firestore.Client, refs: List[firestore.DocumentReference], chunk: int = GET_ALL_CHUNK):
+    snaps = []
+    for i in range(0, len(refs), chunk):
+        snaps.extend(db.get_all(refs[i:i+chunk]))
+    return snaps
 
-def parse_pesquisa_csv(csv_text: str, uasg_alvo: str | None) -> list[dict]:
-    rows = []
-    buf = io.StringIO(csv_text)
-    reader = csv.DictReader(buf, delimiter=';')
-    for r in reader:
-        if uasg_alvo and str(r.get("codigoUasg") or "") != str(uasg_alvo):
+def _load_existing_map(db: firestore.Client, col_name: str, ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not ids:
+        return {}
+    refs = [db.collection(col_name).document(doc_id) for doc_id in ids]
+    out: Dict[str, Dict[str, Any]] = {}
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            out[snap.id] = snap.to_dict()
+    return out
+
+# ============== Cache Firestore para PESQUISA_PRECOS ==============
+def doc_id_preco(id_compra: str, numero_item: str) -> str:
+    return f"{id_compra}-{numero_item}"
+
+def preco_docs_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Set[str]:
+    if not item_nums:
+        return set()
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    existing: Set[str] = set()
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            existing.add(snap.id)
+    return existing
+
+def carregar_cache_precos_existentes(db: firestore.Client, id_compra: str, item_nums: Set[str]) -> Dict[str, Dict[str, Any]]:
+    if not item_nums:
+        return {}
+    refs = [db.collection(COL_PRECO).document(doc_id_preco(id_compra, n)) for n in item_nums]
+    mapa: Dict[str, Dict[str, Any]] = {}
+    for snap in _get_all_chunked(db, refs):
+        if snap.exists:
+            num_item = snap.id.split("-", 1)[1] if "-" in snap.id else None
+            if num_item:
+                mapa[num_item] = snap.to_dict()
+    return mapa
+
+# ============== Paginação PNCP (resultado + páginas) ==============
+ID_RE = re.compile(r"^\d{4,}$")  # ajuste conforme formato esperado
+
+def ler_ids(gc: gspread.Client) -> List[str]:
+    """
+    Lê apenas a coluna 'idCompra' de forma eficiente:
+    - localiza cabeçalho na primeira linha
+    - lê a coluna inteira
+    - normaliza, remove vazios e duplicados
+    """
+    ws = gc.open_by_key(PLANILHA_ID).worksheet(ABA_SHEETS)
+    headers = ws.row_values(1)
+    header_map = {h.strip(): idx + 1 for idx, h in enumerate(headers)}
+    if "idCompra" not in header_map:
+        raise RuntimeError("A aba 'Buscas' deve conter a coluna 'idCompra'.")
+    col = header_map["idCompra"]
+    values = ws.col_values(col)[1:]  # pula header
+    ids = [normalize_str(v) for v in values if normalize_str(v)]
+    ids = [i for i in ids if ID_RE.match(i)]
+    return sorted(set(ids))
+
+def fetch_paginated_resultado(session: requests.Session, endpoint: str, base_params: Dict[str, Any], max_pages: int = MAX_PAGES) -> List[Dict[str, Any]]:
+    resultados: List[Dict[str, Any]] = []
+    page = 1
+    while page <= max_pages:
+        params = dict(base_params)
+        params["pagina"] = page
+        payload = get_json(session, endpoint, params)
+        lista = payload.get("resultado") if isinstance(payload, dict) else None
+        if not isinstance(lista, list) or not lista:
+            break
+        resultados.extend([x for x in lista if isinstance(x, dict)])
+
+        total_paginas = payload.get("totalPaginas")
+        paginas_rest = payload.get("paginasRestantes")
+        if isinstance(total_paginas, int) and page >= total_paginas:
+            break
+        if isinstance(paginas_rest, int) and paginas_rest <= 0:
+            break
+        page += 1
+    return resultados
+
+# ============== Coleta (2.1 e 3.1 por idCompra) ==============
+def get_itens_21_por_id(session: requests.Session, id_compra: str) -> List[Dict[str, Any]]:
+    raw_list = fetch_paginated_resultado(session, EP_ITENS, {"tipo": "idCompra", "codigo": id_compra})
+    itens: List[Dict[str, Any]] = []
+    for raw in raw_list:
+        raw = dict(raw)
+        raw["numeroItemPncp"] = normalize_str(raw.get("numeroItemPncp"))
+        raw["numeroItemCompra"] = normalize_str(raw.get("numeroItemCompra"))
+        raw["codItemCatalogo"] = normalize_str(raw.get("codItemCatalogo"))
+        doc = only_fields(raw, ITENS_KEEP)
+        doc.setdefault("idCompra", id_compra)
+        itens.append(doc)
+    return itens
+
+def get_resultados_31_por_id(session: requests.Session, id_compra: str) -> List[Dict[str, Any]]:
+    raw_list = fetch_paginated_resultado(session, EP_RES, {"tipo": "idCompra", "codigo": id_compra})
+    resultados: List[Dict[str, Any]] = []
+    for raw in raw_list:
+        raw = dict(raw)
+        raw["numeroItemPncp"] = normalize_str(raw.get("numeroItemPncp"))
+        raw["niFornecedor"]   = normalize_str(raw.get("niFornecedor"))
+        doc = only_fields(raw, RESULTADOS_KEEP)
+        doc.setdefault("idCompra", id_compra)
+        resultados.append(doc)
+    return resultados
+
+# ============== Baixar CSV só para itens faltantes e gravar (filtrado por UASG) ==============
+def fetch_and_upsert_pesquisa_precos(
+    db: firestore.Client,
+    session: requests.Session,
+    id_compra: str,
+    itens: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Busca CSVs por codItemCatalogo, filtra por idCompra, numeroItemCompra e UASG_ALVO.
+    Upsert condicional: só grava se houver diferença.
+    """
+    item_nums_all: Set[str] = {pick_num_item_pncp_or_compra(it) for it in itens}
+    item_nums_all = {n for n in item_nums_all if n}
+    codigos: Set[str] = {normalize_str(it.get("codItemCatalogo")) for it in itens if it.get("codItemCatalogo")}
+    codigos = {c for c in codigos if c}
+
+    exists = preco_docs_existentes(db, id_compra, item_nums_all)
+    ja_tem: Set[str] = {doc_id.split("-", 1)[1] for doc_id in exists if "-" in doc_id}
+    faltantes: Set[str] = item_nums_all - ja_tem
+
+    preco_map: Dict[str, Dict[str, Any]] = carregar_cache_precos_existentes(db, id_compra, item_nums_all)
+
+    if not faltantes or not codigos:
+        return preco_map
+
+    for cod in sorted(codigos):
+        if not faltantes:
+            break
+        tried_params = [
+            {"codigoItemCatalogo": cod},
+            {"tipo": "codigoItemCatalogo", "codigo": cod},
+        ]
+        raw = None
+        for params in tried_params:
+            try:
+                raw = get_bytes(session, EP_CSV, params)
+                break
+            except requests.HTTPError:
+                continue
+        if not raw:
             continue
-        rows.append(r)
-    return rows
 
-# ---------------------------
-# Sheets: mapeamento por cabeçalho, leitura ordenada, escrita em lote
-# ---------------------------
+        df = _read_csv_bytes_to_df(raw)
 
-def _mapear_colunas_por_nome(header: list[t.Any]) -> dict:
-    if not header:
-        raise RuntimeError("Cabeçalho da planilha ausente.")
-    name_to_idx = {}
-    for idx, nome in enumerate(header, start=1):
-        key = str(nome).strip().lower() if nome is not None else ""
-        if key:
-            name_to_idx[key] = idx
-    def achar(nome_alvo: str) -> int:
-        k = nome_alvo.strip().lower()
-        if k not in name_to_idx:
-            raise RuntimeError(f"Coluna '{nome_alvo}' não encontrada no cabeçalho.")
-        return name_to_idx[k]
+        real_cols: Dict[str, Optional[str]] = {}
+        for target, candidates in PRECO_FIELD_CANDIDATES.items():
+            real_cols[target] = _get_col(df, candidates)
+
+        col_idcompra = real_cols.get("idCompra")
+        col_numitem  = real_cols.get("numeroItemCompra")
+        col_uasg     = real_cols.get("codigoUasg")
+        if not col_idcompra or not col_numitem or not col_uasg:
+            log.info(f"[PREÇOS] {id_compra}: CSV para codItemCatalogo {cod} sem colunas mínimas. Pulando.")
+            continue
+
+        dff = df[
+            (df[col_idcompra].astype(str).str.strip() == str(id_compra).strip())
+            &
+            (df[col_numitem].astype(str).str.strip().isin({x.strip() for x in faltantes}))
+            &
+            (df[col_uasg].astype(str).str.strip() == str(UASG_ALVO).strip())
+        ]
+        if dff.empty:
+            continue
+
+        # Pré-carrega existentes para comparação condicional
+        existing_ids: List[str] = []
+        for _, row in dff.iterrows():
+            row_dict = row.to_dict()
+            payload = _row_to_precos_payload(row_dict, {k: (v or "") for k, v in real_cols.items()})
+            num_item = payload.get("numeroItemCompra")
+            if not num_item:
+                continue
+            doc_id = doc_id_preco(id_compra, num_item)
+            existing_ids.append(doc_id)
+        existing_map = _load_existing_map(db, COL_PRECO, existing_ids)
+
+        writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+        novos_ids: Set[str] = set()
+        for _, row in dff.iterrows():
+            row_dict = row.to_dict()
+            payload = _row_to_precos_payload(row_dict, {k: (v or "") for k, v in real_cols.items()})
+            num_item = payload.get("numeroItemCompra")
+            if not num_item:
+                continue
+            doc_id = doc_id_preco(id_compra, num_item)
+            payload["updatedAt"] = firestore.SERVER_TIMESTAMP
+
+            if _docs_differ(payload, existing_map.get(doc_id), set(PRECO_FIELD_CANDIDATES.keys())):
+                ref = db.collection(COL_PRECO).document(doc_id)
+                writes.append((ref, payload))
+                preco_map[num_item] = payload
+                novos_ids.add(num_item)
+
+        _commit_in_chunks(writes, db)
+        faltantes -= novos_ids
+        log.info(f"[PREÇOS] {id_compra}: codItemCatalogo {cod} -> upsert {len(novos_ids)}")
+
+    return preco_map
+
+# ============== Persistência (upsert condicional) ==============
+def upsert_itens(db: firestore.Client, itens: List[Dict[str, Any]]) -> int:
+    if not itens:
+        return 0
+    ids: List[str] = []
+    payload_by_id: Dict[str, Dict[str, Any]] = {}
+    for it in itens:
+        id_compra = it.get("idCompra")
+        num_item  = normalize_str(it.get("numeroItemPncp"))
+        if not id_compra or not num_item:
+            continue
+        doc_id = f"{id_compra}-{num_item}"
+        it_clean = only_fields(it, ITENS_KEEP)
+        it_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
+        ids.append(doc_id)
+        payload_by_id[doc_id] = it_clean
+
+    existing = _load_existing_map(db, COL_ITENS, ids)
+
+    writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+    for doc_id, payload in payload_by_id.items():
+        if _docs_differ(payload, existing.get(doc_id), ITENS_KEEP):
+            ref = db.collection(COL_ITENS).document(doc_id)
+            writes.append((ref, payload))
+
+    _commit_in_chunks(writes, db)
+    return len(writes)
+
+def upsert_resultados(db: firestore.Client, resultados: List[Dict[str, Any]]) -> int:
+    if not resultados:
+        return 0
+
+    ids: List[str] = []
+    payload_by_id: Dict[str, Dict[str, Any]] = {}
+    for r in resultados:
+        id_compra = r.get("idCompra")
+        num_item  = normalize_str(r.get("numeroItemPncp"))
+        ni        = normalize_str(r.get("niFornecedor"))
+        if not id_compra or not num_item or not ni:
+            continue
+        doc_id = f"{id_compra}-{num_item}-{ni}"
+        r_clean = only_fields(r, RESULTADOS_KEEP)
+        r_clean["updatedAt"] = firestore.SERVER_TIMESTAMP
+        ids.append(doc_id)
+        payload_by_id[doc_id] = r_clean
+
+    existing = _load_existing_map(db, COL_RES, ids)
+
+    writes: List[Tuple[firestore.DocumentReference, Dict[str, Any]]] = []
+    for doc_id, payload in payload_by_id.items():
+        if _docs_differ(payload, existing.get(doc_id), RESULTADOS_KEEP):
+            ref = db.collection(COL_RES).document(doc_id)
+            writes.append((ref, payload))
+
+    _commit_in_chunks(writes, db)
+    return len(writes)
+
+# ============== Pipeline ==============
+def processar():
+    creds_sheets = build_sheets_credentials()
+    creds_fs = build_firestore_credentials()
+
+    gc = make_sheets_client(creds_sheets)
+    db = make_firestore_client(creds_fs)
+    session = make_session()
+
+    log.info(f"Firestore conectado no projeto: {db.project}")
+    log.info(f"PLANILHA_ID={PLANILHA_ID} ABA_SHEETS={ABA_SHEETS} UASG_ALVO={UASG_ALVO} DRY_RUN={DRY_RUN}")
+
+    ids = ler_ids(gc)
+    log.info(f"IDs a processar: {ids}")
+
+    for idc in ids:
+        try:
+            log.info(f"==> {idc}")
+            # 1) Coletar Itens e Resultados atuais do PNCP
+            itens = get_itens_21_por_id(session, idc)
+            log.info(f"[2.1] {idc}: itens = {len(itens)}")
+
+            resultados = get_resultados_31_por_id(session, idc)
+            log.info(f"[3.1] {idc}: resultados = {len(resultados)}")
+
+            # 2) Persistir ITENS e RESULTADOS apenas se houver diferença
+            changed_itens = upsert_itens(db, itens)
+            changed_resultados = upsert_resultados(db, resultados)
+
+            log.info(f"[UPSERT] {idc}: ITENS alterados={changed_itens} | RESULTADOS alterados={changed_resultados}")
+
+            # 3) Só buscar Pesquisa de Preços se RESULTADOS mudou
+            if changed_resultados > 0:
+                _ = fetch_and_upsert_pesquisa_precos(db, session, idc, itens)
+            else:
+                log.info(f"[PREÇOS] {idc}: pulado (sem mudanças em RESULTADOS).")
+
+        except requests.HTTPError as e:
+            body = e.response.text[:500] if e.response is not None else ""
+            log.error(f"HTTPError {idc}: status={getattr(e.response,'status_code',None)} body={body}")
+        except Exception as e:
+            log.exception(f"Falha em {idc}: {e}")
+
+# --- INÍCIO: adicionar ao script.py (antes do if __name__ == '__main__') ---
+
+def run_once(id_compra: str) -> dict:
+    """
+    Executa o fluxo para um único id_compra e retorna métricas para a planilha.
+    Retorno:
+      {
+        "itens_encontrados": int,
+        "resultados_encontrados": int,
+        "houve_modificacao": bool
+      }
+    """
+
+    # [1] BUSCA PNCP 2.1 e 3.1 — SUBSTITUA PELOS NOMES REAIS DAS SUAS FUNÇÕES
+    # Exemplo comum no seu código:
+    # itens = get_itens_21_por_id(id_compra)
+    # resultados = get_resultados_31_por_id(id_compra)
+    itens = get_itens_21_por_id(id_compra)               # <--- TROQUE AQUI SE O NOME FOR DIFERENTE
+    resultados = get_resultados_31_por_id(id_compra)     # <--- TROQUE AQUI SE O NOME FOR DIFERENTE
+
+    itens_count = len(itens) if itens else 0
+    resultados_count = len(resultados) if resultados else 0
+
+    # [2] APLICA TRANSFORMAÇÃO + UPSERTS CONDICIONAIS — USE SUAS FUNÇÕES REAIS
+    # Esta função deve realizar os upserts nos seus 2 conjuntos (ITENS/RESULTADOS),
+    # respeitando o diff canônico que você já tem, e retornar True/False se houve write.
+    houve_modificacao = aplicar_upserts_condicionais(id_compra, itens, resultados)  # <--- TROQUE AQUI SE O NOME FOR DIFERENTE
+
+    # [3] PESQUISA DE PREÇOS (CSV) — SOMENTE SE SUA LÓGICA ATUAL ASSIM DETERMINAR
+    # Mantenha a política: rodar somente quando houver mudança relevante, se assim já faz hoje.
+    try:
+        coletar_e_persistir_pesquisa_precos_se_necessario(id_compra, itens, resultados)  # <--- TROQUE AQUI SE O NOME FOR DIFERENTE
+    except NameError:
+        # Se seu projeto não implementa pesquisa de preços, ignore silenciosamente.
+        pass
+
     return {
-        "id_col": achar(HDR_IDCOMPRA),
-        "data_col": achar(HDR_DATABUSCA),
-        "status_col": achar(HDR_STATUS),
+        "itens_encontrados": itens_count,
+        "resultados_encontrados": resultados_count,
+        "houve_modificacao": bool(houve_modificacao),
     }
 
-def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str, id_regex: t.Optional[re.Pattern]):
-    values = sheets_read_range(svc, spreadsheet_id, f"{sheet_name}!A1:ZZ")
-    if not values:
-        print("[Sheets] Leitura vazia da planilha.")
-        return [], None
-    header = values[0]
-    cols = _mapear_colunas_por_nome(header)
-    id_col, data_col, status_col = cols["id_col"], cols["data_col"], cols["status_col"]
-    data = values[1:]
-    registros = []
-    for i, row in enumerate(data, start=2):
-        faltam = max(id_col, data_col, status_col) - len(row)
-        if faltam > 0:
-            row = row + [""] * faltam
-        raw_id = row[id_col - 1]
-        id_compra = str(raw_id).strip() if raw_id is not None else ""
-        if not id_compra:
-            continue
-        if id_regex and not id_regex.match(id_compra):
-            continue
-        data_busca_raw = row[data_col - 1] if len(row) >= data_col else ""
-        data_busca_dt = parse_data_busca(data_busca_raw)
-        registros.append({
-            "row_index": i,
-            "idCompra": id_compra,
-            "dataBusca_raw": data_busca_raw,
-            "dataBusca_dt": data_busca_dt
-        })
-    registros.sort(key=lambda it: (
-        0 if it["dataBusca_dt"] is None else 1,
-        it["dataBusca_dt"] or datetime.max.replace(tzinfo=timezone.utc)
-    ))
-    print(f"[Sheets] Colunas: id={id_col}, dataBusca={data_col}, statusBusca={status_col}. Linhas elegíveis={len(registros)}")
-    return registros, cols
-
-# ---------------------------
-# Status
-# ---------------------------
-
-def compor_status(qtd_itens: int, qtd_resultados: int, houve_update: bool, erro: str | None = None) -> str:
-    if erro:
-        msg = str(erro).strip()
-        return f"Erro: {msg[:300]}"
-    base = f"{qtd_itens} itens encontrados; {qtd_resultados} resultados encontrados; "
-    return base + ("Dados atualizados no Banco" if houve_update else "Sem modificações desde a última busca")
-
-# ---------------------------
-# Principal
-# ---------------------------
-
-def processar():
-    spreadsheet_id = _env_str("PLANILHA_ID", "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q")
-    sheet_name     = _env_str("ABA_SHEETS", "Buscas")
-    uasg_alvo      = _env_str("UASG_ALVO")
-    throttle_s     = _env_int("THROTTLE_SECONDS", 0)
-    http_timeout   = _env_int("HTTP_TIMEOUT_SECONDS", 40)
-    http_ua        = _env_str("HTTP_USER_AGENT", "pncp-bot/1.0")
-    dry_run        = _env_bool("DRY_RUN", False)
-    id_regex_env   = _env_str("IDCOMPRA_REGEX")
-    id_regex       = re.compile(id_regex_env) if id_regex_env else None
-
-    print("[Init] Iniciando processamento PNCP.")
-    print(f"[Env] PLANILHA_ID={spreadsheet_id!r} ABA_SHEETS={sheet_name!r} DRY_RUN={dry_run}")
-
-    svc = build_sheets_service()
-    print("[Sheets] Serviço Google Sheets inicializado.")
-    db  = build_firestore_client()
-    print("[Firestore] Cliente Firestore inicializado.")
-
-    filas, cols = ler_dados_planilha_ordenado(svc, spreadsheet_id, sheet_name, id_regex)
-    if not filas:
-        print("[Processo] Nenhuma linha elegível encontrada. Encerrando.")
-        return
-
-    updates_payload: list[dict] = []  # ranges G:H para batchUpdate ao final
-
-    for n, item in enumerate(filas, start=1):
-        row_idx   = item["row_index"]
-        id_compra = item["idCompra"]
-        ts_exec_utc = now_utc()
-        ts_str      = format_ts_local(ts_exec_utc, DEFAULT_TZ)
-
-        qtd_itens = 0
-        qtd_res   = 0
-        houve_upd = False
-        status    = ""
-
-        print(f"[Exec] ({n}/{len(filas)}) idCompra={id_compra} linha={row_idx}")
-
-        try:
-            js_itens = consultar_itens(id_compra, timeout=http_timeout, ua=http_ua)
-            itens = js_itens if isinstance(js_itens, list) else js_itens.get("itens") or js_itens.get("content") or []
-            qtd_itens = len(itens) if itens else 0
-            print(f"[API] Itens={qtd_itens}")
-
-            js_res = consultar_resultados(id_compra, timeout=http_timeout, ua=http_ua)
-            resultados = js_res if isinstance(js_res, list) else js_res.get("resultados") or js_res.get("content") or []
-            qtd_res = len(resultados) if resultados else 0
-            print(f"[API] Resultados={qtd_res}")
-
-            upsert_itens(db, itens, dry_run=dry_run)
-            houve_upd = upsert_resultados(db, resultados, dry_run=dry_run)
-            print(f"[DB] RESULTADOS atualizados={houve_upd}")
-
-            if houve_upd:
-                cod_mats = []
-                for it in itens or []:
-                    cm = it.get("codigoMaterial") or it.get("codigoItem")
-                    if cm:
-                        cod_mats.append(str(cm))
-                cod_mats = list(dict.fromkeys(cod_mats))
-                docs_pesquisa = []
-                for cm in cod_mats[:3]:
-                    csv_txt = consultar_pesquisa_csv(cm, timeout=http_timeout, ua=http_ua)
-                    linhas = parse_pesquisa_csv(csv_txt, uasg_alvo)
-                    for ln in linhas:
-                        ln["idCompra"] = id_compra
-                        ln["numeroItemCompra"] = ln.get("numeroItemCompra") or ln.get("numeroItemPncp") or ""
-                    docs_pesquisa.extend(linhas)
-                    if throttle_s:
-                        time.sleep(throttle_s)
-                upsert_pesquisa_precos(db, docs_pesquisa, dry_run=dry_run)
-                print(f"[DB] Pesquisa de preços gravada={len(docs_pesquisa)}")
-
-            status = compor_status(qtd_itens, qtd_res, houve_upd, erro=None)
-
-        except requests.HTTPError as he:
-            code = he.response.status_code if he.response is not None else "HTTP"
-            status = compor_status(qtd_itens, qtd_res, houve_upd, erro=f"HTTP {code}")
-            print(f"[Erro] HTTP {code} em idCompra={id_compra}")
-        except Exception as e:
-            status = compor_status(qtd_itens, qtd_res, houve_upd, erro=str(e))
-            print(f"[Erro] Exceção em idCompra={id_compra}: {e}")
-
-        # Acumula G/H (dataBusca/statusBusca) para batchUpdate
-        data_col   = cols["data_col"]
-        status_col = cols["status_col"]
-        rng = a1_range(sheet_name, row_idx, data_col, row_idx, status_col)
-        updates_payload.append({
-            "range": rng,
-            "values": [[ts_str, status]]
-        })
-
-        if throttle_s:
-            time.sleep(throttle_s)
-
-    # Escrita em lote no Sheets
-    print(f"[Sheets] Enviando batchUpdate: {len(updates_payload)} linhas...")
-    batch_update_values_with_retry(svc, spreadsheet_id, updates_payload, value_input_option="RAW", max_retries=5)
-    print("[Fim] Processamento concluído.")
+# --- FIM: adicionar ao script.py ---
 
 if __name__ == "__main__":
     processar()

@@ -39,10 +39,18 @@ jobs:
           echo "$FIREBASE_SA_JSON" > firebase_sa.json
           echo "$GCP_SHEETS_SA_JSON" > gcp_sheets_sa.json
 
-      - name: Run script
+      - name: Run orchestrator
         env:
           FIREBASE_SA_PATH: firebase_sa.json
           GCP_SHEETS_SA_PATH: gcp_sheets_sa.json
           FIRESTORE_PROJECT_ID: get-comprasgov
+          PLANILHA_ID: ${{ secrets.PLANILHA_ID }}
+          ABA_SHEETS: ${{ secrets.ABA_SHEETS }}
+          THROTTLE_SECONDS: "0.5"
+          HTTP_TIMEOUT_SECONDS: "30"
+          MAX_PAGES: "20"
+          BATCH_CHUNK_SIZE: "450"
+          GET_ALL_CHUNK: "450"
+          DRY_RUN: "false"
         run: |
-          python script.py
+          python orchestrator.py
