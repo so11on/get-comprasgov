@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-PNCP Data Pipeline: leitura do Google Sheets, consultas PNCP, gravação no Firestore,
-ordenação por dataBusca, carimbo de data/hora e status na planilha.
+PNCP Data Pipeline: leitura do Google Sheets (Buscas), consultas PNCP, gravação no Firestore,
+ordenação por dataBusca, carimbo de data/hora e status na planilha, com escrita em lote.
 
 Atende:
-1) Escrever em "dataBusca" (G) a data/hora da última consulta.
-2) Processar em ordem: primeiro dataBusca vazia; depois por dataBusca crescente.
-3) Escrever em "statusBusca" (H) o resumo da busca.
-4) Correção de cota: escrita no Sheets via batchUpdate com retry/backoff.
+1) Escrever em "dataBusca" a data/hora da última consulta.
+2) Processar em ordem: primeiro dataBusca vazia; depois dataBusca crescente.
+3) Escrever em "statusBusca" o resumo da busca.
+4) Corrige erro: name 'http_get' is not defined (função reintroduzida).
+5) Evita 429 no Sheets: usa values.batchUpdate com retry/backoff.
 
-Planilha:
-- PLANILHA_ID padrão: 1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q
-- ABA_SHEETS padrão: "Buscas"
-- Colunas identificadas por nome de cabeçalho (case-insensitive): "idCompra", "dataBusca", "statusBusca"
+Defaults exigidos:
+- PLANILHA_ID = 1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q
+- ABA_SHEETS  = Buscas
+- Cabeçalhos: idCompra, dataBusca, statusBusca (case-insensitive)
 """
 
 import os
@@ -30,6 +31,10 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.cloud.firestore_v1 as firestore
 
+# ---------------------------
+# Config
+# ---------------------------
+
 DEFAULT_TZ = "America/Sao_Paulo"
 
 BASE = "https://pncp.gov.br/api"
@@ -40,6 +45,10 @@ EP_CSV   = f"{BASE}/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
 HDR_IDCOMPRA   = "idCompra"
 HDR_DATABUSCA  = "dataBusca"
 HDR_STATUS     = "statusBusca"
+
+# ---------------------------
+# Utils
+# ---------------------------
 
 def _env_str(name: str, default: t.Optional[str] = None) -> t.Optional[str]:
     v = os.getenv(name)
@@ -102,10 +111,15 @@ def parse_data_busca(value: t.Any) -> t.Optional[datetime]:
             continue
     return None
 
+# Reintroduzido: http_get ausente em versões anteriores
     headers = {}
     if ua:
         headers["User-Agent"] = ua
     return requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+
+# ---------------------------
+# Google Sheets
+# ---------------------------
 
 def build_sheets_service():
     path = _env_str("GCP_SHEETS_SA_PATH")
@@ -166,6 +180,10 @@ def a1_range(sheet_name: str, start_row: int, start_col: int, end_row: int, end_
         return s
     return f"{sheet_name}!{col_to_a(start_col)}{start_row}:{col_to_a(end_col)}{end_row}"
 
+# ---------------------------
+# Firestore
+# ---------------------------
+
 def build_firestore_client():
     path = _env_str("FIREBASE_SA_PATH")
     content = _env_str("FIREBASE_SA_JSON")
@@ -180,6 +198,10 @@ def build_firestore_client():
     else:
         creds = service_account.Credentials.from_service_account_file(path)
     return firestore.Client(project=project_id, credentials=creds)
+
+# ---------------------------
+# PNCP API
+# ---------------------------
 
 def consultar_itens(id_compra: str, timeout: int, ua: str | None) -> dict:
     r = http_get(EP_ITENS, params={"idCompra": id_compra}, timeout=timeout, ua=ua)
@@ -196,6 +218,10 @@ def consultar_pesquisa_csv(codigo_material: str, timeout: int, ua: str | None) -
     r.raise_for_status()
     return r.text
 
+# ---------------------------
+# Normalização/Comparação
+# ---------------------------
+
 def normalizar_documento(d: dict) -> dict:
     x = dict(d or {})
     x.pop("updatedAt", None)
@@ -203,6 +229,10 @@ def normalizar_documento(d: dict) -> dict:
 
 def documentos_diferem(a: dict, b: dict) -> bool:
     return normalizar_documento(a) != normalizar_documento(b)
+
+# ---------------------------
+# Firestore upserts
+# ---------------------------
 
 def upsert_itens(db: firestore.Client, itens: list[dict], dry_run: bool):
     if not itens:
@@ -251,6 +281,10 @@ def upsert_pesquisa_precos(db: firestore.Client, docs: list[dict], dry_run: bool
     if not dry_run:
         batch.commit()
 
+# ---------------------------
+# CSV -> objetos
+# ---------------------------
+
 def parse_pesquisa_csv(csv_text: str, uasg_alvo: str | None) -> list[dict]:
     rows = []
     buf = io.StringIO(csv_text)
@@ -260,6 +294,10 @@ def parse_pesquisa_csv(csv_text: str, uasg_alvo: str | None) -> list[dict]:
             continue
         rows.append(r)
     return rows
+
+# ---------------------------
+# Sheets: mapeamento por cabeçalho, leitura ordenada, escrita em lote
+# ---------------------------
 
 def _mapear_colunas_por_nome(header: list[t.Any]) -> dict:
     if not header:
@@ -275,9 +313,9 @@ def _mapear_colunas_por_nome(header: list[t.Any]) -> dict:
             raise RuntimeError(f"Coluna '{nome_alvo}' não encontrada no cabeçalho.")
         return name_to_idx[k]
     return {
-        "id_col": achar("idcompra"),
-        "data_col": achar("databusca"),
-        "status_col": achar("statusbusca"),
+        "id_col": achar(HDR_IDCOMPRA),
+        "data_col": achar(HDR_DATABUSCA),
+        "status_col": achar(HDR_STATUS),
     }
 
 def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str, id_regex: t.Optional[re.Pattern]):
@@ -315,12 +353,20 @@ def ler_dados_planilha_ordenado(svc, spreadsheet_id: str, sheet_name: str, id_re
     print(f"[Sheets] Colunas: id={id_col}, dataBusca={data_col}, statusBusca={status_col}. Linhas elegíveis={len(registros)}")
     return registros, cols
 
+# ---------------------------
+# Status
+# ---------------------------
+
 def compor_status(qtd_itens: int, qtd_resultados: int, houve_update: bool, erro: str | None = None) -> str:
     if erro:
         msg = str(erro).strip()
         return f"Erro: {msg[:300]}"
     base = f"{qtd_itens} itens encontrados; {qtd_resultados} resultados encontrados; "
     return base + ("Dados atualizados no Banco" if houve_update else "Sem modificações desde a última busca")
+
+# ---------------------------
+# Principal
+# ---------------------------
 
 def processar():
     spreadsheet_id = _env_str("PLANILHA_ID", "1JZfkhwmgnSSpaRo9Bnr0mP7VPhEWO0XkDZAbm4fAY9Q")
@@ -346,7 +392,7 @@ def processar():
         print("[Processo] Nenhuma linha elegível encontrada. Encerrando.")
         return
 
-    updates_payload: list[dict] = []  # para batchUpdate
+    updates_payload: list[dict] = []  # ranges G:H para batchUpdate ao final
 
     for n, item in enumerate(filas, start=1):
         row_idx   = item["row_index"]
@@ -406,7 +452,7 @@ def processar():
             status = compor_status(qtd_itens, qtd_res, houve_upd, erro=str(e))
             print(f"[Erro] Exceção em idCompra={id_compra}: {e}")
 
-        # Acumula atualização G/H para batchUpdate
+        # Acumula G/H (dataBusca/statusBusca) para batchUpdate
         data_col   = cols["data_col"]
         status_col = cols["status_col"]
         rng = a1_range(sheet_name, row_idx, data_col, row_idx, status_col)
@@ -418,9 +464,8 @@ def processar():
         if throttle_s:
             time.sleep(throttle_s)
 
-    # Escrita única (ou em poucos lotes) no Sheets
+    # Escrita em lote no Sheets
     print(f"[Sheets] Enviando batchUpdate: {len(updates_payload)} linhas...")
-    # Opcional: fatiar para payloads grandes; aqui vai em 1 chamada
     batch_update_values_with_retry(svc, spreadsheet_id, updates_payload, value_input_option="RAW", max_retries=5)
     print("[Fim] Processamento concluído.")
 
