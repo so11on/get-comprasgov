@@ -1,9 +1,9 @@
 name: compras-gov-cron
 
 on:
-  schedule:
-    - cron: "0 11,17,23 * * *"   # 08:00, 14:00, 20:00 BRT (UTC-3) → 11:00, 17:00, 23:00 UTC
-  workflow_dispatch: {}           # habilita botão "Run workflow"
+  #schedule:
+    #- cron: "0 11,17,23 * * *"   # 08:00, 14:00, 20:00 BRT (UTC-3) → 11:00, 17:00, 23:00 UTC
+  #workflow_dispatch: {}           # #habilita botão "Run workflow"
 
 permissions:
   contents: read
@@ -53,4 +53,4 @@ jobs:
           GET_ALL_CHUNK: "450"
           DRY_RUN: "false"
         run: |
-          python script.py
+          #python script.py
